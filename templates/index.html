@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ED Physician Roster</title>
+  <style>
+    /* ── Reset / base ───────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    header {
+      background: #161b22;
+      border-bottom: 2px solid #21262d;
+      padding: 1rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #58a6ff;
+      flex: 1 1 auto;
+    }
+
+    #status-bar {
+      font-size: 0.8rem;
+      color: #8b949e;
+      white-space: nowrap;
+    }
+
+    #refresh-btn {
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.45rem 1rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    #refresh-btn:hover { background: #2ea043; }
+    #refresh-btn:disabled { background: #444; cursor: default; }
+
+    /* ── Main grid ───────────────────────────────────────────────── */
+    main {
+      padding: 1.25rem 1.5rem;
+    }
+
+    #error-banner {
+      display: none;
+      background: #3d1f1f;
+      border: 1px solid #f85149;
+      color: #f85149;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+    }
+
+    #areas-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+
+    /* ── Area card ───────────────────────────────────────────────── */
+    .area-card {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .area-card.supertrack {
+      border-color: #d29922;
+    }
+
+    .area-header {
+      padding: 0.6rem 0.85rem;
+      font-size: 0.95rem;
+      font-weight: 700;
+      background: #1c2230;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .supertrack .area-header {
+      background: #2d2008;
+      color: #f0b429;
+    }
+
+    .badge-st {
+      background: #d29922;
+      color: #0d1117;
+      font-size: 0.65rem;
+      font-weight: 800;
+      border-radius: 4px;
+      padding: 0.1rem 0.35rem;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Physicians list ─────────────────────────────────────────── */
+    .area-body {
+      padding: 0.6rem 0.85rem;
+      flex: 1;
+    }
+
+    .section-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8b949e;
+      margin-bottom: 0.35rem;
+    }
+
+    .physician-list {
+      list-style: none;
+    }
+
+    .physician-item {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      padding: 0.25rem 0;
+      border-bottom: 1px solid #21262d;
+      font-size: 0.9rem;
+    }
+    .physician-item:last-child { border-bottom: none; }
+
+    .physician-name {
+      flex: 1;
+      font-weight: 600;
+    }
+
+    .shift-time {
+      font-size: 0.72rem;
+      color: #8b949e;
+      white-space: nowrap;
+    }
+
+    .empty-msg {
+      color: #484f58;
+      font-size: 0.82rem;
+      font-style: italic;
+    }
+
+    /* ── Arriving soon section ───────────────────────────────────── */
+    .arriving-section {
+      padding: 0.5rem 0.85rem 0.7rem;
+      background: #0d1117;
+      border-top: 1px dashed #21262d;
+    }
+
+    .arriving-section .section-label {
+      color: #3fb950;
+    }
+
+    .arriving-item {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      padding: 0.2rem 0;
+      font-size: 0.85rem;
+    }
+
+    .arriving-name {
+      flex: 1;
+      color: #3fb950;
+    }
+
+    .arriving-eta {
+      font-size: 0.72rem;
+      color: #3fb950;
+      white-space: nowrap;
+    }
+
+    /* ── Loading overlay ─────────────────────────────────────────── */
+    #loading {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(13,17,23,0.6);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      color: #58a6ff;
+    }
+    #loading.show { display: flex; }
+
+    /* ── Spinner ─────────────────────────────────────────────────── */
+    .spinner {
+      width: 1.2em;
+      height: 1.2em;
+      border: 3px solid #58a6ff44;
+      border-top-color: #58a6ff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 0.6rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⚕ Emergency Department Physician Roster</h1>
+    <span id="status-bar">Loading…</span>
+    <button id="refresh-btn">↻ Refresh</button>
+  </header>
+
+  <main>
+    <div id="error-banner"></div>
+    <div id="areas-grid"></div>
+  </main>
+
+  <div id="loading"><div class="spinner"></div> Fetching roster…</div>
+
+  <script>
+    const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+    let refreshTimer = null;
+
+    // ── Helpers ────────────────────────────────────────────────────
+
+    function esc(str) {
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
+    function formatDateTime(iso) {
+      try {
+        return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } catch (_) { return ''; }
+    }
+
+    // ── Render ─────────────────────────────────────────────────────
+
+    function renderAreas(areas) {
+      const grid = document.getElementById('areas-grid');
+
+      if (!areas.length) {
+        grid.innerHTML = '<p style="color:#8b949e;padding:1rem;">No shift data available for today.</p>';
+        return;
+      }
+
+      grid.innerHTML = areas.map(area => {
+        const stBadge = area.is_supertrack
+          ? '<span class="badge-st">ST</span>'
+          : '';
+
+        // Current physicians
+        let currentHTML;
+        if (area.current_physicians.length) {
+          const items = area.current_physicians.map(p => `
+            <li class="physician-item">
+              <span class="physician-name">${esc(p.name)}</span>
+              <span class="shift-time">${esc(p.shift_start)}–${esc(p.shift_end)}</span>
+            </li>`).join('');
+          currentHTML = `<ul class="physician-list">${items}</ul>`;
+        } else {
+          currentHTML = '<p class="empty-msg">No physicians currently on shift</p>';
+        }
+
+        // Arriving soon
+        let arrivingHTML = '';
+        if (area.arriving_soon.length) {
+          const items = area.arriving_soon.map(p => `
+            <div class="arriving-item">
+              <span class="arriving-name">${esc(p.name)}</span>
+              <span class="arriving-eta">in ${esc(String(p.minutes_until))} min (${esc(p.shift_start)})</span>
+            </div>`).join('');
+          arrivingHTML = `
+            <div class="arriving-section">
+              <div class="section-label">Arriving within 1 hour</div>
+              ${items}
+            </div>`;
+        }
+
+        return `
+          <div class="area-card ${area.is_supertrack ? 'supertrack' : ''}">
+            <div class="area-header">${stBadge}${esc(area.name)}</div>
+            <div class="area-body">
+              <div class="section-label">Currently present</div>
+              ${currentHTML}
+            </div>
+            ${arrivingHTML}
+          </div>`;
+      }).join('');
+    }
+
+    // ── Fetch ──────────────────────────────────────────────────────
+
+    async function fetchRoster() {
+      const btn = document.getElementById('refresh-btn');
+      const loading = document.getElementById('loading');
+      const errorBanner = document.getElementById('error-banner');
+      const statusBar = document.getElementById('status-bar');
+
+      btn.disabled = true;
+      loading.classList.add('show');
+      errorBanner.style.display = 'none';
+
+      try {
+        const resp = await fetch('/api/roster');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        if (data.error) {
+          errorBanner.textContent = `⚠ ${data.error}`;
+          errorBanner.style.display = 'block';
+        }
+
+        renderAreas(data.areas || []);
+
+        const updated = data.last_updated
+          ? new Date(data.last_updated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          : '—';
+        statusBar.textContent = `Last updated: ${updated}`;
+      } catch (err) {
+        errorBanner.textContent = `⚠ Failed to load roster: ${err.message}`;
+        errorBanner.style.display = 'block';
+        statusBar.textContent = 'Error';
+      } finally {
+        btn.disabled = false;
+        loading.classList.remove('show');
+      }
+    }
+
+    function scheduleRefresh() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        fetchRoster().finally(scheduleRefresh);
+      }, REFRESH_INTERVAL_MS);
+    }
+
+    // ── Init ───────────────────────────────────────────────────────
+
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      fetchRoster().finally(scheduleRefresh);
+    });
+
+    // Initial load
+    fetchRoster().finally(scheduleRefresh);
+  </script>
+</body>
+</html>
