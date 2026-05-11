@@ -148,6 +148,34 @@
       font-weight: 600;
     }
 
+    .next-triangle {
+      color: #f0b429;
+      font-size: 0.8rem;
+      line-height: 1;
+      width: 0.9rem;
+      text-align: center;
+      flex: 0 0 0.9rem;
+    }
+
+    .next-triangle.placeholder {
+      visibility: hidden;
+    }
+
+    .physician-item.supertrack-rr {
+      cursor: pointer;
+    }
+
+    .physician-item.supertrack-rr:hover {
+      background: #1f2632;
+      border-radius: 4px;
+    }
+
+    .rr-hint {
+      margin-top: 0.35rem;
+      color: #d29922;
+      font-size: 0.72rem;
+    }
+
     .shift-time {
       font-size: 0.72rem;
       color: #8b949e;
@@ -234,6 +262,8 @@
   <script>
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
     let refreshTimer = null;
+    let lastAreas = [];
+    const supertrackRoundRobinNext = {};
 
     // ── Helpers ────────────────────────────────────────────────────
 
@@ -249,10 +279,15 @@
       } catch (_) { return ''; }
     }
 
+    function physicianKey(p) {
+      return `${p.name}|${p.shift_start}|${p.shift_end}`;
+    }
+
     // ── Render ─────────────────────────────────────────────────────
 
     function renderAreas(areas) {
       const grid = document.getElementById('areas-grid');
+      lastAreas = areas;
 
       if (!areas.length) {
         grid.innerHTML = '<p style="color:#8b949e;padding:1rem;">No shift data available for today.</p>';
@@ -267,12 +302,24 @@
         // Current physicians
         let currentHTML;
         if (area.current_physicians.length) {
+          const rrKey = area.name;
+          const currentKeys = area.current_physicians.map(physicianKey);
+          if (!supertrackRoundRobinNext[rrKey] || !currentKeys.includes(supertrackRoundRobinNext[rrKey])) {
+            supertrackRoundRobinNext[rrKey] = currentKeys[0];
+          }
+
           const items = area.current_physicians.map(p => `
-            <li class="physician-item">
+            <li class="physician-item ${area.is_supertrack ? 'supertrack-rr' : ''}"
+                ${area.is_supertrack ? `data-area-name="${esc(area.name)}" data-phys-key="${esc(physicianKey(p))}"` : ''}>
+              ${area.is_supertrack
+                ? (supertrackRoundRobinNext[rrKey] === physicianKey(p)
+                  ? '<span class="next-triangle" title="Next in line">&#9650;</span>'
+                  : '<span class="next-triangle placeholder">&#9650;</span>')
+                : ''}
               <span class="physician-name">${esc(p.name)}</span>
               <span class="shift-time">${esc(p.shift_start)}–${esc(p.shift_end)}</span>
             </li>`).join('');
-          currentHTML = `<ul class="physician-list">${items}</ul>`;
+          currentHTML = `<ul class="physician-list">${items}</ul>${area.is_supertrack ? '<div class="rr-hint">Click the current physician to advance next assignment.</div>' : ''}`;
         } else {
           currentHTML = '<p class="empty-msg">No physicians currently on shift</p>';
         }
@@ -302,6 +349,26 @@
             ${arrivingHTML}
           </div>`;
       }).join('');
+
+      // Supertrack-only round robin: clicking the current physician advances the marker.
+      grid.querySelectorAll('.physician-item.supertrack-rr').forEach(item => {
+        item.addEventListener('click', () => {
+          const areaName = item.dataset.areaName;
+          const physKey = item.dataset.physKey;
+          if (!areaName || !physKey) return;
+
+          const area = lastAreas.find(a => a.name === areaName);
+          if (!area || !Array.isArray(area.current_physicians) || !area.current_physicians.length) return;
+
+          const keys = area.current_physicians.map(physicianKey);
+          const clickedIdx = keys.indexOf(physKey);
+          if (clickedIdx === -1) return;
+
+          const nextIdx = (clickedIdx + 1) % keys.length;
+          supertrackRoundRobinNext[areaName] = keys[nextIdx];
+          renderAreas(lastAreas);
+        });
+      });
     }
 
     // ── Fetch ──────────────────────────────────────────────────────

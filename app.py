@@ -14,6 +14,11 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 
 # Window (in hours) within which an upcoming shift start is shown as "arriving soon".
 ARRIVING_SOON_WINDOW_HOURS = 1
+TARGET_FACILITY_ID = 10
+
+# Most recent ShiftAdmin request error details, used to provide diagnostics
+# in API responses.
+LAST_SHIFTADMIN_ERROR = None
 
 
 def _credentials():
@@ -22,18 +27,93 @@ def _credentials():
     )
 
 
+def _set_last_shiftadmin_error(endpoint, err_type, message, status_code=None):
+    global LAST_SHIFTADMIN_ERROR
+    LAST_SHIFTADMIN_ERROR = {
+        "endpoint": endpoint,
+        "type": err_type,
+        "message": message,
+        "status_code": status_code,
+    }
+
+
 def _post(endpoint, extra_params=None):
+    global LAST_SHIFTADMIN_ERROR
+    LAST_SHIFTADMIN_ERROR = None
+
     user, password = _credentials()
-    payload = {"user": user, "password": password}
+    payload = {}
     if extra_params:
         payload.update(extra_params)
+
     try:
         resp = requests.post(
-            f"{SHIFTADMIN_BASE_URL}/{endpoint}", data=payload, timeout=15
+            f"{SHIFTADMIN_BASE_URL}/{endpoint}", auth=(user, password), json=payload, timeout=15
         )
         resp.raise_for_status()
         return resp.json()
+    except requests.exceptions.Timeout as exc:
+        _set_last_shiftadmin_error(
+            endpoint,
+            "timeout",
+            "Request to ShiftAdmin timed out.",
+        )
+        logger.error("ShiftAdmin timeout (%s): %s", endpoint, exc)
+        return None
+    except requests.exceptions.ConnectionError as exc:
+        _set_last_shiftadmin_error(
+            endpoint,
+            "network",
+            "Could not connect to ShiftAdmin.",
+        )
+        logger.error("ShiftAdmin connection error (%s): %s", endpoint, exc)
+        return None
+    except requests.exceptions.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        response_text = (exc.response.text[:200] if exc.response is not None else "")
+        if status_code in (401, 403):
+            _set_last_shiftadmin_error(
+                endpoint,
+                "auth",
+                "ShiftAdmin rejected credentials (401/403).",
+                status_code=status_code,
+            )
+        else:
+            _set_last_shiftadmin_error(
+                endpoint,
+                "http",
+                f"ShiftAdmin returned HTTP {status_code}.",
+                status_code=status_code,
+            )
+        logger.error(
+            "ShiftAdmin HTTP error (%s): status=%s body=%s",
+            endpoint,
+            status_code,
+            response_text,
+        )
+        return None
+    except requests.exceptions.RequestException as exc:
+        _set_last_shiftadmin_error(
+            endpoint,
+            "request",
+            "Unexpected request error while calling ShiftAdmin.",
+        )
+        logger.error("ShiftAdmin request error (%s): %s", endpoint, exc)
+        return None
+    except ValueError as exc:
+        _set_last_shiftadmin_error(
+            endpoint,
+            "response_parse",
+            "ShiftAdmin response was not valid JSON.",
+        )
+        logger.error("ShiftAdmin JSON parse error (%s): %s", endpoint, exc)
+        return None
     except Exception as exc:
+        _set_last_shiftadmin_error(
+            endpoint,
+            "unknown",
+            "Unexpected error while calling ShiftAdmin.",
+        )
         logger.error("ShiftAdmin API error (%s): %s", endpoint, exc)
         return None
 
@@ -43,6 +123,7 @@ def _parse_dt(value):
     if not value:
         return None
     for fmt in (
+        "%m/%d/%Y %H:%M",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M",
@@ -87,15 +168,35 @@ def _is_physician(shift, physician_ids):
     return ptype in ("physician", "attending", "doctor", "md", "do")
 
 
+def _is_supertrack_shift(shift_name):
+    """Return True when a shift should be grouped under the Supertrack card."""
+    if not shift_name:
+        return False
+    lower_name = shift_name.lower()
+    if "supertrack" in lower_name:
+        return True
+    normalized = lower_name.replace("-", " ").replace("/", " ")
+    return "st" in normalized.split()
+
+
 def build_roster():
     now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
+    start_date = now.date().isoformat()
+    end_date = start_date
 
     # --- 1. Fetch provider types from org_users ---
     physician_ids = set()
     users_data = _post("org_users")
-    if users_data:
-        for u in users_data.get("users", users_data.get("org_users", [])):
+    users = []
+    if isinstance(users_data, dict):
+        users = users_data.get("users", users_data.get("org_users", []))
+    elif isinstance(users_data, list):
+        users = users_data
+
+    if users:
+        for u in users:
+            if not isinstance(u, dict):
+                continue
             utype = u.get("user_type", u.get("type", "")).lower()
             if utype in ("physician", "attending", "doctor", "md", "do"):
                 uid = str(u.get("user_id", u.get("id", "")))
@@ -105,36 +206,58 @@ def build_roster():
     # --- 2. Fetch scheduled shifts for today ---
     shifts_data = _post(
         "org_scheduled_shifts",
-        {"date_start": today, "date_end": today, "date": today},
+        {"type": "json", "start_date": start_date, "end_date": end_date},
     )
 
     if shifts_data is None:
+        error_info = LAST_SHIFTADMIN_ERROR or {}
         return {
             "areas": [],
             "last_updated": now.isoformat(),
             "error": "Unable to reach ShiftAdmin API.",
+            "error_type": error_info.get("type", "unknown"),
+            "error_detail": error_info.get(
+                "message", "No additional ShiftAdmin error details available."
+            ),
         }
 
-    raw_shifts = shifts_data.get(
-        "scheduled_shifts",
-        shifts_data.get("shifts", shifts_data.get("org_scheduled_shifts", [])),
-    )
+    raw_shifts = []
+    if isinstance(shifts_data, dict):
+        raw_shifts = shifts_data.get(
+            "scheduled_shifts",
+            shifts_data.get("shifts", shifts_data.get("org_scheduled_shifts", [])),
+        )
+    elif isinstance(shifts_data, list):
+        raw_shifts = shifts_data
 
     areas = {}
 
     for shift in raw_shifts:
+        if not isinstance(shift, dict):
+            continue
+        if str(shift.get("facility_id", "")) != str(TARGET_FACILITY_ID):
+            continue
         if not _is_physician(shift, physician_ids):
             continue
 
         shift_name = shift.get(
             "shift_name", shift.get("name", shift.get("shift", "Unknown"))
         )
+        is_supertrack = _is_supertrack_shift(shift_name)
+        area_key = "__supertrack__" if is_supertrack else shift_name
+        area_name = "Supertrack" if is_supertrack else shift_name
 
         start_dt = _parse_dt(
-            shift.get("start_datetime", shift.get("start_time", ""))
+            shift.get("start_datetime")
+            or shift.get("start_time")
+            or shift.get("shift_start")
+            or shift.get("published_shift_start", "")
         )
         end_dt = _parse_dt(
-            shift.get("end_datetime", shift.get("end_time", ""))
+            shift.get("end_datetime")
+            or shift.get("end_time")
+            or shift.get("shift_end")
+            or shift.get("published_shift_end", "")
         )
 
         if start_dt is None or end_dt is None:
@@ -146,27 +269,27 @@ def build_roster():
         # Only place this physician in an area if the shift is active or
         # starting within the next hour; otherwise skip entirely.
         if start_dt <= now <= end_dt:
-            if shift_name not in areas:
-                areas[shift_name] = {
-                    "name": shift_name,
-                    "is_supertrack": "ST" in shift_name,
+            if area_key not in areas:
+                areas[area_key] = {
+                    "name": area_name,
+                    "is_supertrack": is_supertrack,
                     "current_physicians": [],
                     "arriving_soon": [],
                 }
-            areas[shift_name]["current_physicians"].append({
+            areas[area_key]["current_physicians"].append({
                 "name": name,
                 "shift_start": start_dt.strftime("%H:%M"),
                 "shift_end": end_dt.strftime("%H:%M"),
             })
         elif now < start_dt <= now + timedelta(hours=ARRIVING_SOON_WINDOW_HOURS):
-            if shift_name not in areas:
-                areas[shift_name] = {
-                    "name": shift_name,
-                    "is_supertrack": "ST" in shift_name,
+            if area_key not in areas:
+                areas[area_key] = {
+                    "name": area_name,
+                    "is_supertrack": is_supertrack,
                     "current_physicians": [],
                     "arriving_soon": [],
                 }
-            areas[shift_name]["arriving_soon"].append({
+            areas[area_key]["arriving_soon"].append({
                 "name": name,
                 "shift_start": start_dt.strftime("%H:%M"),
                 "shift_end": end_dt.strftime("%H:%M"),

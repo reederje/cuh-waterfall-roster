@@ -29,6 +29,7 @@ def _make_shift(shift_name, start_offset_minutes, end_offset_minutes,
         "user_id": user_id,
         "user_name": user_name,
         "user_type": user_type,
+        "facility_id": 10,
     }
 
 
@@ -42,6 +43,11 @@ def test_parse_dt_iso_with_T():
 def test_parse_dt_space_separator():
     dt = flask_app._parse_dt("2024-06-15 08:30:00")
     assert dt == datetime(2024, 6, 15, 8, 30, 0)
+
+
+def test_parse_dt_shiftadmin_slash_format():
+    dt = flask_app._parse_dt("5/7/2026 23:00")
+    assert dt == datetime(2026, 5, 7, 23, 0, 0)
 
 
 def test_parse_dt_returns_none_on_empty():
@@ -191,7 +197,24 @@ def test_build_roster_supertrack_sorted_first():
         result = flask_app.build_roster()
 
     names = [a["name"] for a in result["areas"]]
-    assert names.index("ST Pods") < names.index("ED Main")
+    assert names.index("Supertrack") < names.index("ED Main")
+
+
+def test_build_roster_merges_supertrack_shifts_into_single_area():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Supertrack Rapid", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    supertrack_areas = [a for a in result["areas"] if a["name"] == "Supertrack"]
+    assert len(supertrack_areas) == 1
+    names = [p["name"] for p in supertrack_areas[0]["current_physicians"]]
+    assert "Dr. A" in names
+    assert "Dr. B" in names
 
 
 def test_build_roster_filters_non_physicians():
@@ -234,12 +257,91 @@ def test_build_roster_uses_org_users_for_physician_ids():
     assert "Unknown Person" not in names
 
 
+def test_build_roster_handles_org_users_as_list():
+    """Some ShiftAdmin responses return org_users as a top-level list."""
+    users = [
+        {"user_id": "10", "user_type": "Physician"},
+    ]
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="10", user_name="Dr. Known"),
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="99", user_name="Unknown Person"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(users, shifts)):
+        result = flask_app.build_roster()
+
+    area = result["areas"][0]
+    names = [p["name"] for p in area["current_physicians"]]
+    assert "Dr. Known" in names
+    assert "Unknown Person" not in names
+
+
+def test_build_roster_parses_shiftadmin_shift_start_and_end_fields():
+    now = datetime.now()
+    start = now - timedelta(minutes=30)
+    end = now + timedelta(minutes=30)
+    shifts = {
+        "scheduled_shifts": [
+            {
+                "shift_name": "ED Main",
+                "shift_start": f"{start.month}/{start.day}/{start.year} {start.strftime('%H:%M')}",
+                "shift_end": f"{end.month}/{end.day}/{end.year} {end.strftime('%H:%M')}",
+                "user_id": "1",
+                "first_name": "Joby",
+                "last_name": "Thoppil",
+                "user_type": "Physician",
+                "facility_id": 10,
+            }
+        ]
+    }
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    assert len(result["areas"]) == 1
+    area = result["areas"][0]
+    assert area["name"] == "ED Main"
+    assert len(area["current_physicians"]) == 1
+    assert area["current_physicians"][0]["name"] == "Joby Thoppil"
+
+
 def test_build_roster_api_failure_returns_error():
     with patch.object(flask_app, "_post", return_value=None):
         result = flask_app.build_roster()
 
     assert "error" in result
     assert result["areas"] == []
+    assert "error_type" in result
+    assert "error_detail" in result
+
+
+def test_post_sets_auth_error_type_for_401_or_403():
+    class _Resp:
+        status_code = 401
+        text = "Unauthorized"
+
+        def raise_for_status(self):
+            raise flask_app.requests.exceptions.HTTPError(response=self)
+
+    with patch.object(flask_app.requests, "post", return_value=_Resp()):
+        result = flask_app._post("org_users")
+
+    assert result is None
+    assert flask_app.LAST_SHIFTADMIN_ERROR["type"] == "auth"
+    assert flask_app.LAST_SHIFTADMIN_ERROR["status_code"] == 401
+
+
+def test_post_sets_network_error_type_for_connection_error():
+    with patch.object(
+        flask_app.requests,
+        "post",
+        side_effect=flask_app.requests.exceptions.ConnectionError("boom"),
+    ):
+        result = flask_app._post("org_users")
+
+    assert result is None
+    assert flask_app.LAST_SHIFTADMIN_ERROR["type"] == "network"
 
 
 def test_build_roster_skips_shift_with_bad_times():
@@ -251,6 +353,7 @@ def test_build_roster_skips_shift_with_bad_times():
             "user_id": "1",
             "user_name": "Dr. Smith",
             "user_type": "Physician",
+            "facility_id": 10,
         }
     ]}
     with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
