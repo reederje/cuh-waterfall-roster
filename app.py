@@ -1,9 +1,14 @@
+import base64
 import logging
 import os
 from datetime import datetime, timedelta
+from functools import wraps
 
 import requests
-from flask import Flask, jsonify, render_template
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -19,6 +24,31 @@ TARGET_FACILITY_ID = 10
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
 LAST_SHIFTADMIN_ERROR = None
+
+# Roster app authentication
+AUTH_USERNAME = "cuhed"
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
+
+
+def _check_auth(username, password):
+    """Verify HTTP Basic Auth credentials."""
+    return username == AUTH_USERNAME and password == AUTH_PASSWORD
+
+
+def _require_auth(f):
+    """Decorator to protect routes with HTTP Basic Auth."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not _check_auth(auth.username, auth.password):
+            return (
+                jsonify({"error": "Unauthorized"}),
+                401,
+                {"WWW-Authenticate": 'Basic realm="Roster Access"'},
+            )
+        return f(*args, **kwargs)
+
+    return decorated_function
 
 
 def _credentials():
@@ -306,11 +336,13 @@ def build_roster():
 
 
 @app.route("/")
+@_require_auth
 def index():
     return render_template("index.html")
 
 
 @app.route("/api/roster")
+@_require_auth
 def api_roster():
     return jsonify(build_roster())
 

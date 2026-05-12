@@ -1,5 +1,7 @@
 """Tests for app.py core logic using a mocked ShiftAdmin API."""
+import base64
 import json
+import os
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -12,6 +14,9 @@ import app as flask_app
 
 @pytest.fixture
 def client():
+    if "AUTH_PASSWORD" not in os.environ:
+        os.environ["AUTH_PASSWORD"] = "test_password"
+    flask_app.AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
     flask_app.app.config["TESTING"] = True
     with flask_app.app.test_client() as c:
         yield c
@@ -365,10 +370,29 @@ def test_build_roster_skips_shift_with_bad_times():
 
 # ── HTTP routes ────────────────────────────────────────────────────────────
 
-def test_index_route_returns_200(client):
+def _get_auth_headers():
+    """Build HTTP Basic Auth headers for testing."""
+    password = os.environ.get("AUTH_PASSWORD", "test_password")
+    credentials = base64.b64encode(b"cuhed:" + password.encode()).decode()
+    return {"Authorization": f"Basic {credentials}"}
+
+
+def test_index_route_rejects_missing_auth(client):
     resp = client.get("/")
+    assert resp.status_code == 401
+    assert "WWW-Authenticate" in resp.headers
+
+
+def test_index_route_returns_200(client):
+    resp = client.get("/", headers=_get_auth_headers())
     assert resp.status_code == 200
     assert b"Roster" in resp.data
+
+
+def test_api_roster_rejects_missing_auth(client):
+    resp = client.get("/api/roster")
+    assert resp.status_code == 401
+    assert "WWW-Authenticate" in resp.headers
 
 
 def test_api_roster_returns_json(client):
@@ -376,7 +400,7 @@ def test_api_roster_returns_json(client):
         _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
     ]}
     with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
-        resp = client.get("/api/roster")
+        resp = client.get("/api/roster", headers=_get_auth_headers())
 
     assert resp.status_code == 200
     data = json.loads(resp.data)
@@ -389,7 +413,7 @@ def test_api_roster_area_structure(client):
         _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
     ]}
     with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
-        resp = client.get("/api/roster")
+        resp = client.get("/api/roster", headers=_get_auth_headers())
 
     area = json.loads(resp.data)["areas"][0]
     assert "name" in area
