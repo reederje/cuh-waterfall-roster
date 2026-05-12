@@ -20,6 +20,7 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 # Window (in hours) within which an upcoming shift start is shown as "arriving soon".
 ARRIVING_SOON_WINDOW_HOURS = 1
 TARGET_FACILITY_ID = 10
+COLOR_AREAS = ("Gray", "Blue", "Purple", "Orange")
 
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
@@ -209,6 +210,30 @@ def _is_supertrack_shift(shift_name):
     return "st" in normalized.split()
 
 
+def _color_area_name(shift_name):
+    """Return canonical color area name when the shift contains one."""
+    if not shift_name:
+        return None
+
+    tokens = []
+    current = []
+    for ch in shift_name.lower():
+        if "a" <= ch <= "z":
+            current.append(ch)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+
+    for color in COLOR_AREAS:
+        color_lower = color.lower()
+        if color_lower in tokens or f"n{color_lower}" in tokens:
+            return color
+
+    return None
+
+
 def build_roster():
     now = datetime.now()
     start_date = now.date().isoformat()
@@ -228,7 +253,7 @@ def build_roster():
             if not isinstance(u, dict):
                 continue
             utype = u.get("user_type", u.get("type", "")).lower()
-            if utype in ("physician", "attending", "doctor", "md", "do"):
+            if utype in ("physician", "attending", "doctor", "md", "do", "instructor"):
                 uid = str(u.get("user_id", u.get("id", "")))
                 if uid:
                     physician_ids.add(uid)
@@ -274,8 +299,17 @@ def build_roster():
             "shift_name", shift.get("name", shift.get("shift", "Unknown"))
         )
         is_supertrack = _is_supertrack_shift(shift_name)
-        area_key = "__supertrack__" if is_supertrack else shift_name
-        area_name = "Supertrack" if is_supertrack else shift_name
+        color_area = _color_area_name(shift_name)
+
+        if is_supertrack:
+            area_key = "__supertrack__"
+            area_name = "Supertrack"
+        elif color_area:
+            area_key = f"__color__{color_area.lower()}"
+            area_name = color_area
+        else:
+            area_key = shift_name
+            area_name = shift_name
 
         start_dt = _parse_dt(
             shift.get("start_datetime")

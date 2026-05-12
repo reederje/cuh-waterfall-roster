@@ -222,6 +222,55 @@ def test_build_roster_merges_supertrack_shifts_into_single_area():
     assert "Dr. B" in names
 
 
+def test_build_roster_merges_color_shifts_into_single_area():
+    shifts = {"scheduled_shifts": [
+        _make_shift("CUH Blue 1 3p-11p", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Blue 2 11p-7a", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    blue_areas = [a for a in result["areas"] if a["name"] == "Blue"]
+    assert len(blue_areas) == 1
+    names = [p["name"] for p in blue_areas[0]["current_physicians"]]
+    assert "Dr. A" in names
+    assert "Dr. B" in names
+
+
+def test_build_roster_keeps_different_color_areas_separate():
+    shifts = {"scheduled_shifts": [
+        _make_shift("CUH Blue 1 3p-11p", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Gray Fast Track", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    names = [a["name"] for a in result["areas"]]
+    assert "Blue" in names
+    assert "Gray" in names
+
+
+def test_build_roster_merges_nprefixed_color_into_same_area():
+    shifts = {"scheduled_shifts": [
+        _make_shift("nPurple 7a-3p", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Purple 3p-11p", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    purple_areas = [a for a in result["areas"] if a["name"] == "Purple"]
+    assert len(purple_areas) == 1
+    names = [p["name"] for p in purple_areas[0]["current_physicians"]]
+    assert "Dr. A" in names
+    assert "Dr. B" in names
+
+
 def test_build_roster_filters_non_physicians():
     """Residents and APPs should be excluded from the roster."""
     shifts = {"scheduled_shifts": [
