@@ -23,7 +23,8 @@ def client():
 
 
 def _make_shift(shift_name, start_offset_minutes, end_offset_minutes,
-                user_id="1", user_name="Dr. Smith", user_type="Physician"):
+                user_id="1", user_name="Dr. Smith", user_type="Physician",
+                first_name="Dr.", last_name="Smith", group_id=1):
     now = datetime.now()
     start = now + timedelta(minutes=start_offset_minutes)
     end = now + timedelta(minutes=end_offset_minutes)
@@ -34,7 +35,10 @@ def _make_shift(shift_name, start_offset_minutes, end_offset_minutes,
         "user_id": user_id,
         "user_name": user_name,
         "user_type": user_type,
+        "first_name": first_name,
+        "last_name": last_name,
         "facility_id": 10,
+        "group_id": group_id,
     }
 
 
@@ -80,27 +84,6 @@ def test_provider_name_from_first_last():
 
 def test_provider_name_fallback():
     assert flask_app._provider_name({}) == "Unknown"
-
-
-# ── _is_physician ──────────────────────────────────────────────────────────
-
-def test_is_physician_with_physician_ids_match():
-    assert flask_app._is_physician({"user_id": "42"}, {"42"}) is True
-
-
-def test_is_physician_with_physician_ids_no_match():
-    assert flask_app._is_physician({"user_id": "99"}, {"42"}) is False
-
-
-def test_is_physician_fallback_type_field():
-    assert flask_app._is_physician({"user_type": "Physician"}, set()) is True
-    assert flask_app._is_physician({"user_type": "Resident"}, set()) is False
-    assert flask_app._is_physician({"user_type": "APP"}, set()) is False
-
-
-def test_is_physician_empty_type_defaults_true():
-    """If no type info at all, include the provider (defensive)."""
-    assert flask_app._is_physician({}, set()) is True
 
 
 # ── build_roster ───────────────────────────────────────────────────────────
@@ -271,66 +254,6 @@ def test_build_roster_merges_nprefixed_color_into_same_area():
     assert "Dr. B" in names
 
 
-def test_build_roster_filters_non_physicians():
-    """Residents and APPs should be excluded from the roster."""
-    shifts = {"scheduled_shifts": [
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="1", user_name="Dr. Physician", user_type="Physician"),
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="2", user_name="Resident Bob", user_type="Resident"),
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="3", user_name="APP Carol", user_type="APP"),
-    ]}
-    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
-        result = flask_app.build_roster()
-
-    area = result["areas"][0]
-    names = [p["name"] for p in area["current_physicians"]]
-    assert "Dr. Physician" in names
-    assert "Resident Bob" not in names
-    assert "APP Carol" not in names
-
-
-def test_build_roster_uses_org_users_for_physician_ids():
-    """When org_users returns physician IDs, those should be used for filtering."""
-    users = {"users": [
-        {"user_id": "10", "user_type": "Physician"},
-    ]}
-    shifts = {"scheduled_shifts": [
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="10", user_name="Dr. Known"),
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="99", user_name="Unknown Person"),
-    ]}
-    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(users, shifts)):
-        result = flask_app.build_roster()
-
-    area = result["areas"][0]
-    names = [p["name"] for p in area["current_physicians"]]
-    assert "Dr. Known" in names
-    assert "Unknown Person" not in names
-
-
-def test_build_roster_handles_org_users_as_list():
-    """Some ShiftAdmin responses return org_users as a top-level list."""
-    users = [
-        {"user_id": "10", "user_type": "Physician"},
-    ]
-    shifts = {"scheduled_shifts": [
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="10", user_name="Dr. Known"),
-        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30,
-                    user_id="99", user_name="Unknown Person"),
-    ]}
-    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(users, shifts)):
-        result = flask_app.build_roster()
-
-    area = result["areas"][0]
-    names = [p["name"] for p in area["current_physicians"]]
-    assert "Dr. Known" in names
-    assert "Unknown Person" not in names
-
-
 def test_build_roster_parses_shiftadmin_shift_start_and_end_fields():
     now = datetime.now()
     start = now - timedelta(minutes=30)
@@ -346,6 +269,7 @@ def test_build_roster_parses_shiftadmin_shift_start_and_end_fields():
                 "last_name": "Thoppil",
                 "user_type": "Physician",
                 "facility_id": 10,
+                "group_id": 1,
             }
         ]
     }

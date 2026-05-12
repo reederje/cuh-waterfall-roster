@@ -182,23 +182,6 @@ def _provider_name(record):
     return full or "Unknown"
 
 
-def _is_physician(shift, physician_ids):
-    """
-    Return True if the provider on this shift should be displayed.
-    Priority: cross-reference with physician_ids set from org_users.
-    Fallback: check the type/user_type field on the shift itself.
-    """
-    if physician_ids:
-        pid = str(shift.get("user_id", shift.get("provider_id", "")))
-        return pid in physician_ids
-
-    ptype = shift.get("user_type", shift.get("provider_type", "")).lower()
-    # If the API omits the type field entirely, include everyone.
-    if not ptype:
-        return True
-    return ptype in ("physician", "attending", "doctor", "md", "do")
-
-
 def _is_supertrack_shift(shift_name):
     """Return True when a shift should be grouped under the Supertrack card."""
     if not shift_name:
@@ -239,26 +222,7 @@ def build_roster():
     start_date = now.date().isoformat()
     end_date = start_date
 
-    # --- 1. Fetch provider types from org_users ---
-    physician_ids = set()
-    users_data = _post("org_users")
-    users = []
-    if isinstance(users_data, dict):
-        users = users_data.get("users", users_data.get("org_users", []))
-    elif isinstance(users_data, list):
-        users = users_data
-
-    if users:
-        for u in users:
-            if not isinstance(u, dict):
-                continue
-            utype = u.get("user_type", u.get("type", "")).lower()
-            if utype in ("physician", "attending", "doctor", "md", "do", "instructor"):
-                uid = str(u.get("user_id", u.get("id", "")))
-                if uid:
-                    physician_ids.add(uid)
-
-    # --- 2. Fetch scheduled shifts for today ---
+    # --- Fetch scheduled shifts for today ---
     shifts_data = _post(
         "org_scheduled_shifts",
         {"type": "json", "start_date": start_date, "end_date": end_date},
@@ -292,7 +256,7 @@ def build_roster():
             continue
         if str(shift.get("facility_id", "")) != str(TARGET_FACILITY_ID):
             continue
-        if not _is_physician(shift, physician_ids):
+        if shift.get("group_id") != 1:
             continue
 
         shift_name = shift.get(
