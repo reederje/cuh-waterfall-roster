@@ -261,9 +261,10 @@
 
   <script>
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+    const RR_STORAGE_KEY = 'supertrackRoundRobinNext';
     let refreshTimer = null;
     let lastAreas = [];
-    const supertrackRoundRobinNext = {};
+    const supertrackRoundRobinNext = loadRoundRobinState();
 
     // ── Helpers ────────────────────────────────────────────────────
 
@@ -283,16 +284,44 @@
       return `${p.name}|${p.shift_start}|${p.shift_end}`;
     }
 
+    function loadRoundRobinState() {
+      try {
+        const raw = window.localStorage.getItem(RR_STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function saveRoundRobinState() {
+      try {
+        window.localStorage.setItem(RR_STORAGE_KEY, JSON.stringify(supertrackRoundRobinNext));
+      } catch (_) {
+        // Ignore storage failures so rendering still works.
+      }
+    }
+
     // ── Render ─────────────────────────────────────────────────────
 
     function renderAreas(areas) {
       const grid = document.getElementById('areas-grid');
       lastAreas = areas;
+      let stateChanged = false;
 
       if (!areas.length) {
         grid.innerHTML = '<p style="color:#8b949e;padding:1rem;">No shift data available for today.</p>';
         return;
       }
+
+      const supertrackAreaNames = new Set(areas.filter(a => a.is_supertrack).map(a => a.name));
+      Object.keys(supertrackRoundRobinNext).forEach(areaName => {
+        if (!supertrackAreaNames.has(areaName)) {
+          delete supertrackRoundRobinNext[areaName];
+          stateChanged = true;
+        }
+      });
 
       grid.innerHTML = areas.map(area => {
         const stBadge = area.is_supertrack
@@ -306,6 +335,7 @@
           const currentKeys = area.current_physicians.map(physicianKey);
           if (!supertrackRoundRobinNext[rrKey] || !currentKeys.includes(supertrackRoundRobinNext[rrKey])) {
             supertrackRoundRobinNext[rrKey] = currentKeys[0];
+            stateChanged = true;
           }
 
           const items = area.current_physicians.map(p => `
@@ -350,6 +380,8 @@
           </div>`;
       }).join('');
 
+      if (stateChanged) saveRoundRobinState();
+
       // Supertrack-only round robin: clicking the current physician advances the marker.
       grid.querySelectorAll('.physician-item.supertrack-rr').forEach(item => {
         item.addEventListener('click', () => {
@@ -366,6 +398,7 @@
 
           const nextIdx = (clickedIdx + 1) % keys.length;
           supertrackRoundRobinNext[areaName] = keys[nextIdx];
+          saveRoundRobinState();
           renderAreas(lastAreas);
         });
       });
