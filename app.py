@@ -19,6 +19,7 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 
 # Window (in hours) within which an upcoming shift start is shown as "arriving soon".
 ARRIVING_SOON_WINDOW_HOURS = 1
+SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Gray", "Blue", "Purple", "Orange")
 
@@ -297,6 +298,8 @@ def build_roster():
         # Only place this physician in an area if the shift is active or
         # starting within the next hour; otherwise skip entirely.
         if start_dt <= now <= end_dt:
+            if is_supertrack and now >= start_dt + timedelta(hours=SUPERTRACK_ACTIVE_WINDOW_HOURS):
+                continue
             if area_key not in areas:
                 areas[area_key] = {
                     "name": area_name,

@@ -205,6 +205,44 @@ def test_build_roster_merges_supertrack_shifts_into_single_area():
     assert "Dr. B" in names
 
 
+def test_build_roster_supertrack_visible_within_first_six_hours():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-359, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    supertrack_areas = [a for a in result["areas"] if a["name"] == "Supertrack"]
+    assert len(supertrack_areas) == 1
+    names = [p["name"] for p in supertrack_areas[0]["current_physicians"]]
+    assert "Dr. A" in names
+
+
+def test_build_roster_supertrack_hidden_after_first_six_hours():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-361, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    assert result["areas"] == []
+
+
+def test_build_roster_non_supertrack_not_limited_to_six_hours():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-361, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    assert len(result["areas"]) == 1
+    assert result["areas"][0]["name"] == "ED Main"
+    assert len(result["areas"][0]["current_physicians"]) == 1
+
+
 def test_build_roster_merges_color_shifts_into_single_area():
     shifts = {"scheduled_shifts": [
         _make_shift("CUH Blue 1 3p-11p", start_offset_minutes=-30, end_offset_minutes=30,
