@@ -6,6 +6,7 @@ Flask application that displays the CUH ED physician waterfall roster from Shift
 
 - Python 3.11+
 - ShiftAdmin credentials
+- Redis (for shared Supertrack indicator state)
 
 ## 1. Create and activate a virtual environment
 
@@ -46,6 +47,7 @@ Create a `.env` file in the project root with the following values:
 SHIFTADMIN_USER=your_shiftadmin_username
 SHIFTADMIN_PASSWORD=your_shiftadmin_password
 AUTH_PASSWORD=choose_a_password_for_roster_access
+REDIS_URL=redis://localhost:6379/0
 FLASK_DEBUG=0
 ```
 
@@ -53,10 +55,21 @@ Notes:
 
 - `SHIFTADMIN_USER` and `SHIFTADMIN_PASSWORD` are used for calls to ShiftAdmin.
 - `AUTH_PASSWORD` is required for HTTP Basic Auth on the roster endpoints.
+- `REDIS_URL` is used for shared Supertrack indicator state and Socket.IO broadcasting.
 - The Basic Auth username is fixed in code as `cuhed`.
 - Set `FLASK_DEBUG=1` for local debug mode.
 
-## 4. Run the application
+## 4. Start Redis
+
+If Redis is already running in your environment, skip this step.
+
+Docker example:
+
+```bash
+docker run --name cuh-roster-redis -p 6379:6379 -d redis:7
+```
+
+## 5. Run the application
 
 ```bash
 python app.py
@@ -71,7 +84,7 @@ When prompted for credentials in the browser:
 - Username: `cuhed`
 - Password: value of `AUTH_PASSWORD` from your `.env`
 
-## 5. Run tests
+## 6. Run tests
 
 ```bash
 python -m pytest -q

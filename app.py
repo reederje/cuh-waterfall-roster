@@ -4,9 +4,11 @@ import os
 from datetime import datetime, timedelta
 from functools import wraps
 
+import redis
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
+from flask_socketio import SocketIO, emit
 
 load_dotenv()
 
@@ -21,7 +23,10 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 ARRIVING_SOON_WINDOW_HOURS = 1
 SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 TARGET_FACILITY_ID = 10
-COLOR_AREAS = ("Gray", "Blue", "Purple", "Orange")
+COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
+SUPERTRACK_STATE_PREFIX = "cuh-waterfall-roster:supertrack"
+SUPERTRACK_STATE_TTL_SECONDS = 36 * 60 * 60
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
@@ -30,6 +35,24 @@ LAST_SHIFTADMIN_ERROR = None
 # Roster app authentication
 AUTH_USERNAME = "cuhed"
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
+
+_MEMORY_SUPERTRACK_STATE = {}
+
+try:
+    REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    REDIS_CLIENT.ping()
+    REDIS_AVAILABLE = True
+except Exception as exc:
+    REDIS_CLIENT = None
+    REDIS_AVAILABLE = False
+    logger.warning("Redis unavailable, using in-memory supertrack state: %s", exc)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    message_queue=REDIS_URL if REDIS_AVAILABLE else None,
+)
 
 
 def _check_auth(username, password):
@@ -188,7 +211,7 @@ def _is_supertrack_shift(shift_name):
     if not shift_name:
         return False
     lower_name = shift_name.lower()
-    if "supertrack" in lower_name:
+    if "supert" in lower_name:
         return True
     normalized = lower_name.replace("-", " ").replace("/", " ")
     return "st" in normalized.split()
@@ -216,6 +239,74 @@ def _color_area_name(shift_name):
             return color
 
     return None
+
+
+def _physician_key(record):
+    return f"{record.get('name', '')}|{record.get('shift_start', '')}|{record.get('shift_end', '')}"
+
+
+def _state_key(date_key, area_name):
+    return f"{SUPERTRACK_STATE_PREFIX}:{date_key}:{area_name}"
+
+
+def _get_supertrack_indicator_key(date_key, area_name):
+    if REDIS_AVAILABLE:
+        try:
+            return REDIS_CLIENT.get(_state_key(date_key, area_name))
+        except Exception as exc:
+            logger.warning("Redis get failed for supertrack state: %s", exc)
+
+    return _MEMORY_SUPERTRACK_STATE.get((date_key, area_name))
+
+
+def _set_supertrack_indicator_key(date_key, area_name, phys_key):
+    if REDIS_AVAILABLE:
+        try:
+            REDIS_CLIENT.setex(
+                _state_key(date_key, area_name),
+                SUPERTRACK_STATE_TTL_SECONDS,
+                phys_key,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Redis set failed for supertrack state: %s", exc)
+
+    _MEMORY_SUPERTRACK_STATE[(date_key, area_name)] = phys_key
+
+
+def _clear_supertrack_indicator_key(date_key, area_name):
+    if REDIS_AVAILABLE:
+        try:
+            REDIS_CLIENT.delete(_state_key(date_key, area_name))
+            return
+        except Exception as exc:
+            logger.warning("Redis delete failed for supertrack state: %s", exc)
+
+    _MEMORY_SUPERTRACK_STATE.pop((date_key, area_name), None)
+
+
+def _hydrate_supertrack_state(areas, date_key):
+    supertrack_state = {}
+
+    for area in areas:
+        if not area.get("is_supertrack"):
+            continue
+
+        area_name = area.get("name", "")
+        keys = [_physician_key(p) for p in area.get("current_physicians", [])]
+
+        if not keys:
+            _clear_supertrack_indicator_key(date_key, area_name)
+            continue
+
+        current_key = _get_supertrack_indicator_key(date_key, area_name)
+        if not current_key or current_key not in keys:
+            current_key = keys[0]
+            _set_supertrack_indicator_key(date_key, area_name, current_key)
+
+        supertrack_state[area_name] = current_key
+
+    return supertrack_state
 
 
 def build_roster():
@@ -333,7 +424,12 @@ def build_roster():
         key=lambda a: (not a["is_supertrack"], a["name"]),
     )
 
-    return {"areas": sorted_areas, "last_updated": now.isoformat()}
+    supertrack_state = _hydrate_supertrack_state(sorted_areas, start_date)
+    return {
+        "areas": sorted_areas,
+        "last_updated": now.isoformat(),
+        "supertrack_state": supertrack_state,
+    }
 
 
 @app.route("/")
@@ -348,6 +444,56 @@ def api_roster():
     return jsonify(build_roster())
 
 
+@socketio.on("advance_supertrack")
+def handle_advance_supertrack(payload):
+    area_name = (payload or {}).get("area_name")
+    phys_key = (payload or {}).get("phys_key")
+    if not isinstance(area_name, str) or not isinstance(phys_key, str):
+        emit("advance_error", {"message": "Invalid supertrack advance payload."})
+        return
+
+    roster = build_roster()
+    if "error" in roster:
+        emit("advance_error", {"message": "Unable to update indicator while roster API is unavailable."})
+        return
+
+    date_key = datetime.now().date().isoformat()
+    area = next(
+        (
+            item
+            for item in roster.get("areas", [])
+            if item.get("is_supertrack") and item.get("name") == area_name
+        ),
+        None,
+    )
+    if area is None:
+        emit("advance_error", {"message": "Supertrack area was not found."})
+        return
+
+    keys = [_physician_key(p) for p in area.get("current_physicians", [])]
+    if not keys:
+        _clear_supertrack_indicator_key(date_key, area_name)
+        socketio.emit(
+            "supertrack_state_updated",
+            {"area_name": area_name, "phys_key": None},
+        )
+        return
+
+    if phys_key not in keys:
+        phys_key = _get_supertrack_indicator_key(date_key, area_name)
+        if phys_key not in keys:
+            phys_key = keys[0]
+
+    next_idx = (keys.index(phys_key) + 1) % len(keys)
+    next_key = keys[next_idx]
+    _set_supertrack_indicator_key(date_key, area_name, next_key)
+
+    socketio.emit(
+        "supertrack_state_updated",
+        {"area_name": area_name, "phys_key": next_key},
+    )
+
+
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    app.run(debug=debug)
+    socketio.run(app, debug=debug)

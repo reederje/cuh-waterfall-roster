@@ -417,6 +417,7 @@ def test_api_roster_returns_json(client):
     data = json.loads(resp.data)
     assert "areas" in data
     assert "last_updated" in data
+    assert "supertrack_state" in data
 
 
 def test_api_roster_area_structure(client):
