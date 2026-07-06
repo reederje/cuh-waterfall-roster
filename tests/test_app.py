@@ -243,6 +243,40 @@ def test_build_roster_non_supertrack_not_limited_to_six_hours():
     assert len(result["areas"][0]["current_physicians"]) == 1
 
 
+def test_build_roster_queries_previous_day_for_overnight_shifts():
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 6, 0, 30, 0)
+
+    with patch.object(flask_app, "datetime", _FixedDateTime):
+        with patch.object(flask_app, "_post", return_value={"scheduled_shifts": []}) as mocked_post:
+            flask_app.build_roster()
+
+    assert mocked_post.call_count == 1
+    endpoint, params = mocked_post.call_args[0]
+    assert endpoint == "org_scheduled_shifts"
+    assert params["start_date"] == "2026-07-05"
+    assert params["end_date"] == "2026-07-06"
+
+
+def test_build_roster_queries_next_day_for_near_midnight_arrivals():
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 6, 23, 30, 0)
+
+    with patch.object(flask_app, "datetime", _FixedDateTime):
+        with patch.object(flask_app, "_post", return_value={"scheduled_shifts": []}) as mocked_post:
+            flask_app.build_roster()
+
+    assert mocked_post.call_count == 1
+    endpoint, params = mocked_post.call_args[0]
+    assert endpoint == "org_scheduled_shifts"
+    assert params["start_date"] == "2026-07-06"
+    assert params["end_date"] == "2026-07-07"
+
+
 def test_build_roster_merges_color_shifts_into_single_area():
     shifts = {"scheduled_shifts": [
         _make_shift("CUH Blue 1 3p-11p", start_offset_minutes=-30, end_offset_minutes=30,

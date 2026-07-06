@@ -21,6 +21,7 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 
 # Window (in hours) within which an upcoming shift start is shown as "arriving soon".
 ARRIVING_SOON_WINDOW_HOURS = 1
+MAX_SHIFT_HOURS = 12
 SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
@@ -233,6 +234,9 @@ def _color_area_name(shift_name):
     if current:
         tokens.append("".join(current))
 
+    if any(token in tokens for token in ("gray", "ngray", "grey", "ngrey")):
+        return "Gray"
+
     for color in COLOR_AREAS:
         color_lower = color.lower()
         if color_lower in tokens or f"n{color_lower}" in tokens:
@@ -311,8 +315,11 @@ def _hydrate_supertrack_state(areas, date_key):
 
 def build_roster():
     now = datetime.now()
-    start_date = now.date().isoformat()
-    end_date = start_date
+    query_start_dt = now - timedelta(hours=MAX_SHIFT_HOURS)
+    query_end_dt = now + timedelta(hours=ARRIVING_SOON_WINDOW_HOURS)
+    start_date = query_start_dt.date().isoformat()
+    end_date = query_end_dt.date().isoformat()
+    state_date_key = now.date().isoformat()
 
     # --- Fetch scheduled shifts for today ---
     shifts_data = _post(
@@ -424,7 +431,7 @@ def build_roster():
         key=lambda a: (not a["is_supertrack"], a["name"]),
     )
 
-    supertrack_state = _hydrate_supertrack_state(sorted_areas, start_date)
+    supertrack_state = _hydrate_supertrack_state(sorted_areas, state_date_key)
     return {
         "areas": sorted_areas,
         "last_updated": now.isoformat(),
