@@ -39,6 +39,28 @@
       white-space: nowrap;
     }
 
+    .settings-group {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      color: #8b949e;
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+
+    .settings-group label {
+      font-weight: 600;
+    }
+
+    .settings-group select {
+      background: #0d1117;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.35rem 0.5rem;
+      font-size: 0.8rem;
+    }
+
     #refresh-btn {
       background: #238636;
       color: #fff;
@@ -249,6 +271,13 @@
   <header>
     <h1>⚕ Emergency Department Physician Roster</h1>
     <span id="status-bar">Loading…</span>
+    <div class="settings-group">
+      <label for="rr-mode-select">Supertrack mode</label>
+      <select id="rr-mode-select">
+        <option value="sync">Sync round-robin with server</option>
+        <option value="local">Keep my own round-robin</option>
+      </select>
+    </div>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -262,10 +291,15 @@
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
   <script>
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+    const RR_MODE_STORAGE_KEY = 'supertrackRoundRobinMode';
+    const RR_LOCAL_STATE_STORAGE_KEY = 'supertrackRoundRobinLocalState';
+    const RR_MODE_SYNC = 'sync';
+    const RR_MODE_LOCAL = 'local';
     let refreshTimer = null;
     let lastAreas = [];
-    const supertrackRoundRobinNext = {};
     const socket = io();
+    const supertrackRoundRobinNext = loadLocalRoundRobinState();
+    let roundRobinMode = loadRoundRobinMode();
 
     // ── Helpers ────────────────────────────────────────────────────
 
@@ -285,6 +319,46 @@
       return `${p.name}|${p.shift_start}|${p.shift_end}`;
     }
 
+    function loadRoundRobinMode() {
+      try {
+        const stored = window.localStorage.getItem(RR_MODE_STORAGE_KEY);
+        return stored === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
+      } catch (_) {
+        return RR_MODE_SYNC;
+      }
+    }
+
+    function saveRoundRobinMode(mode) {
+      try {
+        window.localStorage.setItem(RR_MODE_STORAGE_KEY, mode);
+      } catch (_) {
+        // Ignore storage failures so rendering still works.
+      }
+    }
+
+    function loadLocalRoundRobinState() {
+      try {
+        const raw = window.localStorage.getItem(RR_LOCAL_STATE_STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function saveLocalRoundRobinState() {
+      try {
+        window.localStorage.setItem(RR_LOCAL_STATE_STORAGE_KEY, JSON.stringify(supertrackRoundRobinNext));
+      } catch (_) {
+        // Ignore storage failures so rendering still works.
+      }
+    }
+
+    function isLocalRoundRobinMode() {
+      return roundRobinMode === RR_MODE_LOCAL;
+    }
+
     function setSupertrackState(nextState) {
       Object.keys(supertrackRoundRobinNext).forEach(key => delete supertrackRoundRobinNext[key]);
       if (nextState && typeof nextState === 'object') {
@@ -294,6 +368,44 @@
           }
         });
       }
+
+      if (isLocalRoundRobinMode()) {
+        saveLocalRoundRobinState();
+      }
+    }
+
+    function setRoundRobinMode(mode) {
+      roundRobinMode = mode === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
+      saveRoundRobinMode(roundRobinMode);
+      document.getElementById('rr-mode-select').value = roundRobinMode;
+    }
+
+    function reconcileRoundRobinState(areas) {
+      let stateChanged = false;
+      const supertrackAreaNames = new Set(areas.filter(area => area.is_supertrack).map(area => area.name));
+
+      Object.keys(supertrackRoundRobinNext).forEach(areaName => {
+        if (!supertrackAreaNames.has(areaName)) {
+          delete supertrackRoundRobinNext[areaName];
+          stateChanged = true;
+        }
+      });
+
+      areas.forEach(area => {
+        if (!area.is_supertrack || !area.current_physicians.length) {
+          return;
+        }
+
+        const currentKeys = area.current_physicians.map(physicianKey);
+        if (!currentKeys.includes(supertrackRoundRobinNext[area.name])) {
+          supertrackRoundRobinNext[area.name] = currentKeys[0];
+          stateChanged = true;
+        }
+      });
+
+      if (stateChanged && isLocalRoundRobinMode()) {
+        saveLocalRoundRobinState();
+      }
     }
 
     // ── Render ─────────────────────────────────────────────────────
@@ -301,6 +413,7 @@
     function renderAreas(areas) {
       const grid = document.getElementById('areas-grid');
       lastAreas = areas;
+      reconcileRoundRobinState(areas);
 
       if (!areas.length) {
         grid.innerHTML = '<p style="color:#8b949e;padding:1rem;">No shift data available for today.</p>';
@@ -377,6 +490,14 @@
           const clickedIdx = keys.indexOf(physKey);
           if (clickedIdx === -1) return;
 
+          if (isLocalRoundRobinMode()) {
+            const nextIdx = (clickedIdx + 1) % keys.length;
+            supertrackRoundRobinNext[areaName] = keys[nextIdx];
+            saveLocalRoundRobinState();
+            renderAreas(lastAreas);
+            return;
+          }
+
           socket.emit('advance_supertrack', {
             area_name: areaName,
             phys_key: physKey,
@@ -407,7 +528,9 @@
           errorBanner.style.display = 'block';
         }
 
-        setSupertrackState(data.supertrack_state || {});
+        if (!isLocalRoundRobinMode()) {
+          setSupertrackState(data.supertrack_state || {});
+        }
         renderAreas(data.areas || []);
 
         const updated = data.last_updated
@@ -437,7 +560,31 @@
       fetchRoster().finally(scheduleRefresh);
     });
 
+    document.getElementById('rr-mode-select').addEventListener('change', event => {
+      const nextMode = event.target.value === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
+
+      if (nextMode === roundRobinMode) {
+        return;
+      }
+
+      setRoundRobinMode(nextMode);
+
+      if (nextMode === RR_MODE_LOCAL) {
+        saveLocalRoundRobinState();
+        if (lastAreas.length) {
+          renderAreas(lastAreas);
+        }
+        return;
+      }
+
+      fetchRoster().finally(scheduleRefresh);
+    });
+
     socket.on('supertrack_state_updated', payload => {
+      if (isLocalRoundRobinMode()) {
+        return;
+      }
+
       if (!payload || typeof payload.area_name !== 'string') return;
 
       if (typeof payload.phys_key === 'string') {
@@ -452,6 +599,7 @@
     });
 
     // Initial load
+    setRoundRobinMode(roundRobinMode);
     fetchRoster().finally(scheduleRefresh);
   </script>
 </body>
