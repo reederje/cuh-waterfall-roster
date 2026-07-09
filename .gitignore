@@ -18,6 +18,10 @@ ENV/
 # Environment / secrets
 .env
 
+# Local application state
+state/
+*.db
+
 # IDEs
 .idea/
 .vscode/

@@ -1,10 +1,11 @@
 import base64
 import logging
 import os
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from functools import wraps
 
-import redis
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
@@ -25,9 +26,7 @@ MAX_SHIFT_HOURS = 12
 SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
-SUPERTRACK_STATE_PREFIX = "cuh-waterfall-roster:supertrack"
-SUPERTRACK_STATE_TTL_SECONDS = 36 * 60 * 60
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
 
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
@@ -36,24 +35,41 @@ LAST_SHIFTADMIN_ERROR = None
 # Roster app authentication
 AUTH_USERNAME = "cuhed"
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
-
-_MEMORY_SUPERTRACK_STATE = {}
-
-try:
-    REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    REDIS_CLIENT.ping()
-    REDIS_AVAILABLE = True
-except Exception as exc:
-    REDIS_CLIENT = None
-    REDIS_AVAILABLE = False
-    logger.warning("Redis unavailable, using in-memory supertrack state: %s", exc)
+_STATE_DB_LOCK = threading.Lock()
 
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode="threading",
-    message_queue=REDIS_URL if REDIS_AVAILABLE else None,
 )
+
+
+def _ensure_state_db():
+    db_dir = os.path.dirname(STATE_DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    with sqlite3.connect(STATE_DB_PATH, timeout=5) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supertrack_state (
+                date_key TEXT NOT NULL,
+                area_name TEXT NOT NULL,
+                phys_key TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (date_key, area_name)
+            )
+            """
+        )
+        conn.commit()
+
+
+def _state_db_conn():
+    return sqlite3.connect(STATE_DB_PATH, timeout=5)
+
+
+_ensure_state_db()
 
 
 def _check_auth(username, password):
@@ -249,44 +265,55 @@ def _physician_key(record):
     return f"{record.get('name', '')}|{record.get('shift_start', '')}|{record.get('shift_end', '')}"
 
 
-def _state_key(date_key, area_name):
-    return f"{SUPERTRACK_STATE_PREFIX}:{date_key}:{area_name}"
-
-
 def _get_supertrack_indicator_key(date_key, area_name):
-    if REDIS_AVAILABLE:
-        try:
-            return REDIS_CLIENT.get(_state_key(date_key, area_name))
-        except Exception as exc:
-            logger.warning("Redis get failed for supertrack state: %s", exc)
-
-    return _MEMORY_SUPERTRACK_STATE.get((date_key, area_name))
+    try:
+        with _state_db_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT phys_key
+                FROM supertrack_state
+                WHERE date_key = ? AND area_name = ?
+                """,
+                (date_key, area_name),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.warning("State DB read failed for supertrack state: %s", exc)
+        return None
 
 
 def _set_supertrack_indicator_key(date_key, area_name, phys_key):
-    if REDIS_AVAILABLE:
-        try:
-            REDIS_CLIENT.setex(
-                _state_key(date_key, area_name),
-                SUPERTRACK_STATE_TTL_SECONDS,
-                phys_key,
-            )
-            return
-        except Exception as exc:
-            logger.warning("Redis set failed for supertrack state: %s", exc)
-
-    _MEMORY_SUPERTRACK_STATE[(date_key, area_name)] = phys_key
+    try:
+        with _STATE_DB_LOCK:
+            with _state_db_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO supertrack_state (date_key, area_name, phys_key, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(date_key, area_name)
+                    DO UPDATE SET phys_key = excluded.phys_key, updated_at = excluded.updated_at
+                    """,
+                    (date_key, area_name, phys_key, datetime.now().isoformat()),
+                )
+                conn.commit()
+    except Exception as exc:
+        logger.warning("State DB write failed for supertrack state: %s", exc)
 
 
 def _clear_supertrack_indicator_key(date_key, area_name):
-    if REDIS_AVAILABLE:
-        try:
-            REDIS_CLIENT.delete(_state_key(date_key, area_name))
-            return
-        except Exception as exc:
-            logger.warning("Redis delete failed for supertrack state: %s", exc)
-
-    _MEMORY_SUPERTRACK_STATE.pop((date_key, area_name), None)
+    try:
+        with _STATE_DB_LOCK:
+            with _state_db_conn() as conn:
+                conn.execute(
+                    """
+                    DELETE FROM supertrack_state
+                    WHERE date_key = ? AND area_name = ?
+                    """,
+                    (date_key, area_name),
+                )
+                conn.commit()
+    except Exception as exc:
+        logger.warning("State DB delete failed for supertrack state: %s", exc)
 
 
 def _hydrate_supertrack_state(areas, date_key):
