@@ -27,6 +27,8 @@ SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
+SUPERTRACK_SELECTION_MODES = ("phase_multiplier", "strict_round_robin")
+DEFAULT_SUPERTRACK_SELECTION_MODE = "phase_multiplier"
 
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
@@ -68,6 +70,15 @@ def _ensure_state_db():
                 shift_key TEXT PRIMARY KEY,
                 patients_assigned INTEGER NOT NULL DEFAULT 0
                     CHECK (patients_assigned >= 0),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supertrack_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -366,9 +377,58 @@ def _supertrack_phase_multiplier(shift_start, now):
     return 2.5
 
 
-def _weighted_supertrack_next(physicians, current_key, now):
+def _get_selection_mode():
+    try:
+        with _state_db_conn() as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM supertrack_settings WHERE setting_key = 'selection_mode'"
+            ).fetchone()
+        if row and row[0] in SUPERTRACK_SELECTION_MODES:
+            return row[0]
+    except Exception as exc:
+        logger.warning("State DB read failed for selection mode: %s", exc)
+    return DEFAULT_SUPERTRACK_SELECTION_MODE
+
+
+def _set_selection_mode(mode):
+    if mode not in SUPERTRACK_SELECTION_MODES:
+        raise ValueError("Invalid Supertrack selection mode.")
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO supertrack_settings (setting_key, setting_value, updated_at)
+                VALUES ('selection_mode', ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (mode, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+
+def _strict_round_robin_next(keys, current_key):
+    if not keys:
+        return None
+    if current_key not in keys:
+        return keys[0]
+    return keys[(keys.index(current_key) + 1) % len(keys)]
+
+
+def _strict_round_robin_current(keys, current_key):
+    if not keys:
+        return None
+    return current_key if current_key in keys else keys[0]
+
+
+def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None):
     if not physicians:
         return None
+
+    keys = [_physician_key(physician) for physician in physicians]
+    if selection_mode == "strict_round_robin":
+        return _strict_round_robin_current(keys, current_key)
 
     scores = {
         _physician_key(physician): (
@@ -381,8 +441,6 @@ def _weighted_supertrack_next(physicians, current_key, now):
     tied_keys = {
         key for key, score in scores.items() if score == lowest_score
     }
-    keys = [_physician_key(physician) for physician in physicians]
-
     if current_key in keys:
         start_index = keys.index(current_key)
         ordered_keys = keys[start_index:] + keys[:start_index]
@@ -443,7 +501,7 @@ def _clear_supertrack_indicator_key(date_key, area_name):
         logger.warning("State DB delete failed for supertrack state: %s", exc)
 
 
-def _hydrate_supertrack_state(areas, date_key, now):
+def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
     supertrack_state = {}
 
     for area in areas:
@@ -459,7 +517,7 @@ def _hydrate_supertrack_state(areas, date_key, now):
 
         current_key = _get_supertrack_indicator_key(date_key, area_name)
         next_key = _weighted_supertrack_next(
-            area.get("current_physicians", []), current_key, now
+            area.get("current_physicians", []), current_key, now, selection_mode
         )
         if next_key != current_key:
             _set_supertrack_indicator_key(date_key, area_name, next_key)
@@ -605,13 +663,17 @@ def build_roster():
             patients_assigned, physician["_shift_start"], now
         )
 
-    supertrack_state = _hydrate_supertrack_state(sorted_areas, state_date_key, now)
+    selection_mode = _get_selection_mode()
+    supertrack_state = _hydrate_supertrack_state(
+        sorted_areas, state_date_key, now, selection_mode
+    )
     for physician in current_physicians:
         del physician["_shift_start"]
     return {
         "areas": sorted_areas,
         "last_updated": now.isoformat(),
         "supertrack_state": supertrack_state,
+        "supertrack_selection_mode": selection_mode,
     }
 
 
@@ -645,6 +707,17 @@ def _emit_roster_update():
     socketio.emit("roster_updated", roster)
 
 
+@socketio.on("set_selection_mode")
+def handle_set_selection_mode(payload):
+    mode = (payload or {}).get("mode")
+    try:
+        _set_selection_mode(mode)
+    except ValueError as exc:
+        emit("assignment_error", {"message": str(exc)})
+        return
+    _emit_roster_update()
+
+
 @socketio.on("record_assignment")
 def handle_record_assignment(payload):
     shift_key = (payload or {}).get("shift_key")
@@ -659,7 +732,7 @@ def handle_record_assignment(payload):
         })
         return
 
-    _, physician = _find_active_physician(roster, shift_key)
+    area, physician = _find_active_physician(roster, shift_key)
     if physician is None:
         emit("assignment_error", {
             "message": "That physician is no longer active on the roster."
@@ -667,6 +740,20 @@ def handle_record_assignment(payload):
         return
 
     _increment_assignment_count(shift_key)
+    if area and area.get("is_supertrack"):
+        keys = [
+            _physician_key(item)
+            for item in area.get("current_physicians", [])
+        ]
+        _set_supertrack_indicator_key(
+            datetime.now().date().isoformat(),
+            area["name"],
+            _strict_round_robin_next(keys, _physician_key(physician))
+            if _get_selection_mode() == "strict_round_robin"
+            else _get_supertrack_indicator_key(
+                datetime.now().date().isoformat(), area["name"]
+            ),
+        )
     _emit_roster_update()
 
 

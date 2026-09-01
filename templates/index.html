@@ -311,6 +311,13 @@
   <header>
     <h1>⚕ Emergency Department Physician Roster</h1>
     <span id="status-bar">Loading…</span>
+    <div class="settings-group">
+      <label for="selection-mode">Next-up method</label>
+      <select id="selection-mode">
+        <option value="phase_multiplier">Phase weighting</option>
+        <option value="strict_round_robin">Strict round robin</option>
+      </select>
+    </div>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -328,6 +335,7 @@
     let lastAreas = [];
     let supertrackState = {};
     let assignmentPending = false;
+    let selectionMode = 'phase_multiplier';
     const socket = io();
 
     // ── Helpers ────────────────────────────────────────────────────
@@ -491,6 +499,8 @@
         }
 
         supertrackState = data.supertrack_state || {};
+        selectionMode = data.supertrack_selection_mode || 'phase_multiplier';
+        document.getElementById('selection-mode').value = selectionMode;
         renderAreas(data.areas || []);
 
         const updated = data.last_updated
@@ -524,6 +534,8 @@
       assignmentPending = false;
       if (!payload || !Array.isArray(payload.areas)) return;
       supertrackState = payload.supertrack_state || {};
+      selectionMode = payload.supertrack_selection_mode || 'phase_multiplier';
+      document.getElementById('selection-mode').value = selectionMode;
       renderAreas(payload.areas);
     });
 
@@ -533,6 +545,11 @@
       errorBanner.textContent = `Warning: ${(payload && payload.message) || 'Unable to update assignment.'}`;
       errorBanner.style.display = 'block';
       if (lastAreas.length) renderAreas(lastAreas);
+    });
+
+    document.getElementById('selection-mode').addEventListener('change', event => {
+      assignmentPending = true;
+      socket.emit('set_selection_mode', { mode: event.target.value });
     });
 
     // Initial load

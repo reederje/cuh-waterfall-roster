@@ -525,6 +525,47 @@ def test_weighted_supertrack_prefers_earlier_shift_phase():
     assert flask_app._weighted_supertrack_next(physicians, None, now) == "Early|13:00|21:00"
 
 
+def test_strict_round_robin_ignores_phase_scores():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = [
+        {
+            "name": "A", "shift_start": "08:00", "shift_end": "16:00",
+            "patients_per_hour": 9.0, "_shift_start": now - timedelta(hours=6),
+        },
+        {
+            "name": "B", "shift_start": "08:00", "shift_end": "16:00",
+            "patients_per_hour": 0.1, "_shift_start": now - timedelta(hours=6),
+        },
+    ]
+
+    assert flask_app._weighted_supertrack_next(
+        physicians, "A|08:00|16:00", now, "strict_round_robin"
+    ) == "A|08:00|16:00"
+    assert flask_app._strict_round_robin_next(
+        ["A|08:00|16:00", "B|08:00|16:00"], "A|08:00|16:00"
+    ) == "B|08:00|16:00"
+
+
+def test_selection_mode_is_persisted_and_broadcast():
+    flask_app._set_selection_mode("strict_round_robin")
+    assert flask_app._get_selection_mode() == "strict_round_robin"
+
+    socket_client = flask_app.socketio.test_client(flask_app.app)
+    with patch.object(flask_app, "build_roster", return_value={
+        "areas": [],
+        "last_updated": "2026-08-28T14:00:00",
+        "supertrack_state": {},
+        "supertrack_selection_mode": "strict_round_robin",
+    }):
+        socket_client.emit("set_selection_mode", {"mode": "strict_round_robin"})
+
+    updates = [
+        event for event in socket_client.get_received()
+        if event["name"] == "roster_updated"
+    ]
+    assert updates[0]["args"][0]["supertrack_selection_mode"] == "strict_round_robin"
+
+
 def test_record_assignment_broadcasts_updated_roster():
     shifts = {"scheduled_shifts": [
         _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
@@ -540,6 +581,28 @@ def test_record_assignment_broadcasts_updated_roster():
     assert len(updates) == 1
     updated_physician = updates[0]["args"][0]["areas"][0]["current_physicians"][0]
     assert updated_physician["patients_assigned"] == 1
+
+
+def test_strict_round_robin_assignment_moves_next_up_marker():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("ST Pods", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        flask_app._set_selection_mode("strict_round_robin")
+        roster = flask_app.build_roster()
+        physicians = roster["areas"][0]["current_physicians"]
+        first_key = physicians[0]["shift_key"]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": first_key})
+        received = socket_client.get_received()
+
+    updates = [event for event in received if event["name"] == "roster_updated"]
+    assert updates[-1]["args"][0]["supertrack_state"]["Supertrack"] == flask_app._physician_key(
+        physicians[1]
+    )
 
 
 def test_supertrack_day_simulation():

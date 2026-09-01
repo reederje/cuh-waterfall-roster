@@ -73,6 +73,38 @@ When prompted for credentials in the browser:
 - Username: `cuhed`
 - Password: value of `AUTH_PASSWORD` from your `.env`
 
+## Cloud deployment
+
+When deploying to Azure App Service or another managed cloud service, the
+application must be started with a production server that supports
+Flask-SocketIO. The local `python app.py` command is not sufficient for these
+hosts, and a plain WSGI command such as `gunicorn app:app` will not handle the
+Socket.IO connection correctly.
+
+For a Linux Azure App Service, set the application **Startup Command** to:
+
+```bash
+gunicorn --worker-class eventlet --workers 1 --bind=0.0.0.0:$PORT app:app
+```
+
+The `gunicorn` and `eventlet` packages are included in `requirements.txt`. The
+`$PORT` value is supplied by the cloud platform and must be used instead of a
+hard-coded local port. Use one worker unless a shared Socket.IO message queue
+has also been configured.
+
+Other cloud providers may use a different configuration field or startup
+format, but the requirements are the same: use a Socket.IO-compatible
+production server, bind to the provider's supplied port, and enable the
+provider's WebSocket support when that setting is available. Consult the
+provider-specific deployment documentation for the exact command field.
+
+For Azure App Service, store the SQLite state file in a writable persistent
+location rather than the deployed application directory, for example:
+
+```text
+STATE_DB_PATH=/home/data/supertrack_state.db
+```
+
 ## 5. Run tests
 
 ```bash
@@ -101,4 +133,4 @@ have no eligible physician during the six-hour Supertrack assignment window.
 
 - Click an active physician card to record a patient assignment. Counts and the Supertrack next-up indicator are shared across connected users.
 - Double-click a physician's patient total to correct it. Press Enter or click elsewhere to commit the value; press Escape to cancel.
-- Supertrack physicians are eligible for their first six hours. The next-up physician has the lowest weighted patient rate: the first two active hours use a $1.0$ multiplier, hours two through four use $1.5$, and hours four through six use $2.0$. Equal scores use the existing roster order as a stable tie-breaker.
+- Supertrack physicians are eligible for their first six hours. The **Next-up method** control switches between **Phase weighting**, which uses the configured phase multipliers, and **Strict round robin**, which advances sequentially through eligible physicians after each assignment. The selected method is shared across connected users and persisted in SQLite.
