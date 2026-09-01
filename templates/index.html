@@ -75,6 +75,134 @@
     #refresh-btn:hover { background: #2ea043; }
     #refresh-btn:disabled { background: #444; cursor: default; }
 
+    #help-btn {
+      background: #58a6ff;
+      color: #0d1117;
+      border: none;
+      border-radius: 6px;
+      padding: 0.45rem 0.75rem;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    #help-btn:hover { background: #79c0ff; }
+
+    /* ── Instructions Modal ────────────────────────────────────────── */
+    #instructions-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.7);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    #instructions-modal.open { display: flex; }
+
+    .instructions-content {
+      background: #161b22;
+      border: 2px solid #58a6ff;
+      border-radius: 12px;
+      max-width: 650px;
+      max-height: 85vh;
+      overflow-y: auto;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    .instructions-header {
+      background: #0d1117;
+      border-bottom: 1px solid #30363d;
+      padding: 1.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+    }
+
+    .instructions-header h2 {
+      color: #58a6ff;
+      font-size: 1.3rem;
+      margin: 0;
+    }
+
+    .close-btn {
+      background: none;
+      border: none;
+      color: #8b949e;
+      font-size: 1.5rem;
+      cursor: pointer;
+      padding: 0;
+      width: 2rem;
+      height: 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .close-btn:hover { color: #e6edf3; }
+
+    .instructions-body {
+      padding: 1.5rem;
+      color: #e6edf3;
+      line-height: 1.6;
+    }
+
+    .instructions-section {
+      margin-bottom: 1.5rem;
+    }
+
+    .instructions-section:last-child {
+      margin-bottom: 0;
+    }
+
+    .instructions-section h3 {
+      color: #58a6ff;
+      font-size: 1.1rem;
+      margin-bottom: 0.75rem;
+      margin-top: 0;
+    }
+
+    .instructions-section p {
+      margin: 0.5rem 0;
+      color: #c9d1d9;
+    }
+
+    .instructions-section ul {
+      margin: 0.5rem 0 0.5rem 1.5rem;
+      padding: 0;
+    }
+
+    .instructions-section li {
+      margin-bottom: 0.4rem;
+      color: #c9d1d9;
+    }
+
+    .instructions-code {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.75rem;
+      font-family: monospace;
+      color: #f0b429;
+      margin: 0.5rem 0;
+      font-size: 0.9rem;
+    }
+
+    .instructions-highlight {
+      background: #1c2d08;
+      border-left: 3px solid #3fb950;
+      padding: 0.75rem;
+      margin: 0.75rem 0;
+      border-radius: 4px;
+    }
+
+    .instructions-highlight strong {
+      color: #3fb950;
+    }
+
     /* ── Main grid ───────────────────────────────────────────────── */
     main {
       padding: 1.25rem 1.5rem;
@@ -318,6 +446,7 @@
         <option value="strict_round_robin">Strict round robin</option>
       </select>
     </div>
+    <button id="help-btn">? Help</button>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -328,6 +457,101 @@
 
   <div id="loading"><div class="spinner"></div> Fetching roster…</div>
 
+  <div id="instructions-modal">
+    <div class="instructions-content">
+      <div class="instructions-header">
+        <h2>How to Use This Interface</h2>
+        <button class="close-btn" id="close-instructions">&times;</button>
+      </div>
+      <div class="instructions-body">
+        
+        <div class="instructions-section">
+          <h3>📋 Overview</h3>
+          <p>This roster tracker displays all Emergency Department physicians grouped by area, showing their current shift status, patient assignments, and upcoming arrivals.</p>
+        </div>
+
+        <div class="instructions-section">
+          <h3>🎯 Recording Patient Assignments</h3>
+          <ul>
+            <li><strong>Click on any physician</strong> to record that they've been assigned the next patient</li>
+            <li>The system will update their patient count and adjust the rotation order</li>
+            <li>Look for visual feedback when the update completes</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>✏️ Editing Patient Counts</h3>
+          <ul>
+            <li><strong>Double-click</strong> on the patient count number to edit it manually</li>
+            <li>Type the correct number and press <span class="instructions-code">Enter</span> to save</li>
+            <li>Press <span class="instructions-code">Escape</span> to cancel without saving</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>📊 Understanding the Display</h3>
+          <div class="instructions-highlight">
+            <strong>Currently present</strong> — Physicians actively on shift right now
+          </div>
+          <ul>
+            <li><strong>Physicians assigned</strong> — Number of patients this physician is currently managing</li>
+            <li><strong>Patients/hour</strong> — Calculated average based on shift duration and assignments</li>
+            <li><strong>Shift time</strong> — Their scheduled shift hours (e.g., 08:00-16:00)</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>⏰ Arriving Soon Section</h3>
+          <p>Shows physicians arriving within the next hour before their shift starts. This helps you prepare for upcoming coverage changes.</p>
+        </div>
+
+        <div class="instructions-section">
+          <h3>🌟 Supertrack Cards (Yellow Badge)</h3>
+          <p>Areas marked with a <span class="instructions-code">ST</span> badge use Supertrack logic:</p>
+          <ul>
+            <li><strong>Upward triangle (▲)</strong> — This physician is next in the rotation</li>
+            <li>Next assignments are selected based on patient rate and time spent on shift</li>
+            <li>This ensures fair distribution across the team</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>🔀 Selection Modes</h3>
+          <p><strong>Phase weighting</strong> (recommended):</p>
+          <ul>
+            <li>Balances patient load and time on shift using adaptive weighting</li>
+            <li>Provides fairest distribution in most scenarios</li>
+          </ul>
+          <p><strong>Strict round robin</strong>:</p>
+          <ul>
+            <li>Simple rotation through physicians in order</li>
+            <li>Each physician gets equal turns regardless of current load</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>🔄 Refresh and Updates</h3>
+          <ul>
+            <li>Click the <strong>↻ Refresh</strong> button to manually fetch latest data</li>
+            <li>Data automatically refreshes every 15 minutes</li>
+            <li>The "Last updated" time in the header shows when data was last synced</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>⚠️ Tips & Troubleshooting</h3>
+          <ul>
+            <li>If you see an error banner, check your network connection and click Refresh</li>
+            <li>Patient counts are editable to correct data entry mistakes</li>
+            <li>The system is real-time—changes sync across all connected devices</li>
+            <li>If a physician appears faded/locked, an update is in progress—wait a moment</li>
+          </ul>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
   <script>
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
@@ -337,6 +561,33 @@
     let assignmentPending = false;
     let selectionMode = 'phase_multiplier';
     const socket = io();
+
+    // ── Instructions Modal Management ───────────────────────────────
+
+    function openInstructions() {
+      document.getElementById('instructions-modal').classList.add('open');
+    }
+
+    function closeInstructions() {
+      document.getElementById('instructions-modal').classList.remove('open');
+    }
+
+    document.getElementById('help-btn').addEventListener('click', openInstructions);
+    document.getElementById('close-instructions').addEventListener('click', closeInstructions);
+
+    // Close modal when clicking outside the content
+    document.getElementById('instructions-modal').addEventListener('click', event => {
+      if (event.target.id === 'instructions-modal') {
+        closeInstructions();
+      }
+    });
+
+    // Close modal with Escape key
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.getElementById('instructions-modal').classList.contains('open')) {
+        closeInstructions();
+      }
+    });
 
     // ── Helpers ────────────────────────────────────────────────────
 
