@@ -12,6 +12,12 @@ import app as flask_app
 
 # ── Fixtures ───────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def state_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(flask_app, "STATE_DB_PATH", str(tmp_path / "state.db"))
+    flask_app._ensure_state_db()
+
+
 @pytest.fixture
 def client():
     if "AUTH_PASSWORD" not in os.environ:
@@ -466,3 +472,138 @@ def test_api_roster_area_structure(client):
     assert "is_supertrack" in area
     assert "current_physicians" in area
     assert "arriving_soon" in area
+
+
+# ── Assignment state and weighted Supertrack ────────────────────────────────
+
+def test_assignment_counts_are_independent_per_shift():
+    first_shift = "1|2026-08-28T08:00:00|2026-08-28T16:00:00"
+    second_shift = "1|2026-08-28T16:00:00|2026-08-29T00:00:00"
+
+    assert flask_app._increment_assignment_count(first_shift) == 1
+    assert flask_app._increment_assignment_count(first_shift) == 2
+    flask_app._set_assignment_count(second_shift, 4)
+
+    assert flask_app._get_assignment_counts([first_shift, second_shift]) == {
+        first_shift: 2,
+        second_shift: 4,
+    }
+
+
+def test_assignment_count_rejects_invalid_values():
+    with pytest.raises(ValueError):
+        flask_app._set_assignment_count("shift", -1)
+    with pytest.raises(ValueError):
+        flask_app._set_assignment_count("shift", 1.5)
+
+
+def test_patients_per_hour_uses_one_hour_minimum_for_new_shift():
+    shift_start = datetime(2026, 8, 28, 8, 0)
+
+    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=5)) == 1.0
+    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(minutes=30)) == 3.0
+    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(hours=2)) == 1.5
+
+
+def test_weighted_supertrack_prefers_earlier_shift_phase():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = [
+        {
+            "name": "Early", "shift_start": "13:00", "shift_end": "21:00",
+            "patients_per_hour": 1.0, "_shift_start": now - timedelta(hours=1),
+        },
+        {
+            "name": "Middle", "shift_start": "11:00", "shift_end": "19:00",
+            "patients_per_hour": 0.9, "_shift_start": now - timedelta(hours=3),
+        },
+        {
+            "name": "Late", "shift_start": "09:00", "shift_end": "17:00",
+            "patients_per_hour": 0.8, "_shift_start": now - timedelta(hours=5),
+        },
+    ]
+
+    assert flask_app._weighted_supertrack_next(physicians, None, now) == "Early|13:00|21:00"
+
+
+def test_record_assignment_broadcasts_updated_roster():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        physician = roster["areas"][0]["current_physicians"][0]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": physician["shift_key"]})
+        received = socket_client.get_received()
+
+    updates = [event for event in received if event["name"] == "roster_updated"]
+    assert len(updates) == 1
+    updated_physician = updates[0]["args"][0]["areas"][0]["current_physicians"][0]
+    assert updated_physician["patients_assigned"] == 1
+
+
+def test_supertrack_day_simulation():
+    """Simulate the supplied average arrivals from 6 AM through 5:59 AM."""
+    simulation_start = datetime(2026, 8, 28, 6, 0)
+    hourly_arrivals = [
+        2, 3, 6, 10, 13, 15, 16, 16, 17, 16, 15, 15,
+        13, 13, 12, 11, 8, 7, 7, 6, 6, 5, 4, 3,
+    ]
+    shift_definitions = [
+        ("A", 0, 8), ("B", 2, 10), ("C", 5, 13), ("D", 6, 14),
+        ("E", 7, 15), ("F", 8, 16), ("G", 10, 18), ("H", 11, 19),
+        ("I", 14, 22), ("J", 17, 25),
+    ]
+    physicians = []
+    for name, start_hour, end_hour in shift_definitions:
+        shift_start = simulation_start + timedelta(hours=start_hour)
+        shift_end = simulation_start + timedelta(hours=end_hour)
+        physicians.append({
+            "name": name,
+            "shift_start": shift_start.strftime("%H:%M"),
+            "shift_end": shift_end.strftime("%H:%M"),
+            "_shift_start": shift_start,
+            "_shift_end": shift_end,
+            "patients_assigned": 0,
+            "patients_per_hour": 0.0,
+        })
+
+    current_key = None
+    unassigned_arrivals = []
+    for hour_offset, arrival_count in enumerate(hourly_arrivals):
+        hour_start = simulation_start + timedelta(hours=hour_offset)
+        for arrival_number in range(arrival_count):
+            arrival_time = hour_start + timedelta(
+                minutes=(arrival_number + 0.5) * 60 / arrival_count
+            )
+            active_physicians = [
+                physician
+                for physician in physicians
+                if physician["_shift_start"] <= arrival_time < physician["_shift_end"]
+                and arrival_time < physician["_shift_start"] + timedelta(hours=6)
+            ]
+            if not active_physicians:
+                unassigned_arrivals.append(arrival_time)
+                continue
+            for physician in active_physicians:
+                physician["patients_per_hour"] = flask_app._patients_per_hour(
+                    physician["patients_assigned"], physician["_shift_start"], arrival_time
+                )
+
+            current_key = flask_app._weighted_supertrack_next(
+                active_physicians, current_key, arrival_time
+            )
+            assigned_physician = next(
+                physician
+                for physician in active_physicians
+                if flask_app._physician_key(physician) == current_key
+            )
+            assigned_physician["patients_assigned"] += 1
+
+    totals = {physician["name"]: physician["patients_assigned"] for physician in physicians}
+    print(
+        "Supertrack simulation: "
+        f"assigned={totals}; unassigned={len(unassigned_arrivals)} "
+        f"({[arrival.strftime('%H:%M') for arrival in unassigned_arrivals]})"
+    )
+    assert sum(totals.values()) + len(unassigned_arrivals) == sum(hourly_arrivals)

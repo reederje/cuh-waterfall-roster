@@ -156,18 +156,61 @@
     }
 
     .physician-item {
-      display: flex;
-      align-items: baseline;
-      gap: 0.5rem;
-      padding: 0.25rem 0;
+      display: grid;
+      grid-template-columns: 1rem 1fr;
+      gap: 0.35rem 0.5rem;
+      padding: 0.55rem;
+      margin-bottom: 0.45rem;
       border-bottom: 1px solid #21262d;
       font-size: 0.9rem;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      cursor: pointer;
     }
     .physician-item:last-child { border-bottom: none; }
 
     .physician-name {
-      flex: 1;
       font-weight: 600;
+    }
+
+    .physician-summary {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      grid-column: 2;
+    }
+
+    .physician-stats {
+      grid-column: 2;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.35rem;
+      color: #8b949e;
+      font-size: 0.72rem;
+    }
+
+    .stat-value {
+      display: block;
+      color: #e6edf3;
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+
+    .patient-count {
+      cursor: text;
+      text-decoration: underline dotted #8b949e;
+      text-underline-offset: 0.15rem;
+    }
+
+    .patient-count-input {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #58a6ff;
+      border-radius: 3px;
+      color: #e6edf3;
+      font: inherit;
+      font-weight: 700;
+      padding: 0.1rem 0.2rem;
     }
 
     .next-triangle {
@@ -183,14 +226,11 @@
       visibility: hidden;
     }
 
-    .physician-item.supertrack-rr {
-      cursor: pointer;
+    .physician-item:hover {
+      background: #1f2632;
     }
 
-    .physician-item.supertrack-rr:hover {
-      background: #1f2632;
-      border-radius: 4px;
-    }
+    .physician-item.pending { opacity: 0.55; pointer-events: none; }
 
     .rr-hint {
       margin-top: 0.35rem;
@@ -271,13 +311,6 @@
   <header>
     <h1>⚕ Emergency Department Physician Roster</h1>
     <span id="status-bar">Loading…</span>
-    <div class="settings-group">
-      <label for="rr-mode-select">Supertrack mode</label>
-      <select id="rr-mode-select">
-        <option value="sync">Sync round-robin with server</option>
-        <option value="local">Keep my own round-robin</option>
-      </select>
-    </div>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -291,15 +324,11 @@
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
   <script>
     const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-    const RR_MODE_STORAGE_KEY = 'supertrackRoundRobinMode';
-    const RR_LOCAL_STATE_STORAGE_KEY = 'supertrackRoundRobinLocalState';
-    const RR_MODE_SYNC = 'sync';
-    const RR_MODE_LOCAL = 'local';
     let refreshTimer = null;
     let lastAreas = [];
+    let supertrackState = {};
+    let assignmentPending = false;
     const socket = io();
-    const supertrackRoundRobinNext = loadLocalRoundRobinState();
-    let roundRobinMode = loadRoundRobinMode();
 
     // ── Helpers ────────────────────────────────────────────────────
 
@@ -315,105 +344,11 @@
       } catch (_) { return ''; }
     }
 
-    function physicianKey(p) {
-      return `${p.name}|${p.shift_start}|${p.shift_end}`;
-    }
-
-    function loadRoundRobinMode() {
-      try {
-        const stored = window.localStorage.getItem(RR_MODE_STORAGE_KEY);
-        return stored === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
-      } catch (_) {
-        return RR_MODE_SYNC;
-      }
-    }
-
-    function saveRoundRobinMode(mode) {
-      try {
-        window.localStorage.setItem(RR_MODE_STORAGE_KEY, mode);
-      } catch (_) {
-        // Ignore storage failures so rendering still works.
-      }
-    }
-
-    function loadLocalRoundRobinState() {
-      try {
-        const raw = window.localStorage.getItem(RR_LOCAL_STATE_STORAGE_KEY);
-        if (!raw) return {};
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : {};
-      } catch (_) {
-        return {};
-      }
-    }
-
-    function saveLocalRoundRobinState() {
-      try {
-        window.localStorage.setItem(RR_LOCAL_STATE_STORAGE_KEY, JSON.stringify(supertrackRoundRobinNext));
-      } catch (_) {
-        // Ignore storage failures so rendering still works.
-      }
-    }
-
-    function isLocalRoundRobinMode() {
-      return roundRobinMode === RR_MODE_LOCAL;
-    }
-
-    function setSupertrackState(nextState) {
-      Object.keys(supertrackRoundRobinNext).forEach(key => delete supertrackRoundRobinNext[key]);
-      if (nextState && typeof nextState === 'object') {
-        Object.entries(nextState).forEach(([key, value]) => {
-          if (typeof value === 'string') {
-            supertrackRoundRobinNext[key] = value;
-          }
-        });
-      }
-
-      if (isLocalRoundRobinMode()) {
-        saveLocalRoundRobinState();
-      }
-    }
-
-    function setRoundRobinMode(mode) {
-      roundRobinMode = mode === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
-      saveRoundRobinMode(roundRobinMode);
-      document.getElementById('rr-mode-select').value = roundRobinMode;
-    }
-
-    function reconcileRoundRobinState(areas) {
-      let stateChanged = false;
-      const supertrackAreaNames = new Set(areas.filter(area => area.is_supertrack).map(area => area.name));
-
-      Object.keys(supertrackRoundRobinNext).forEach(areaName => {
-        if (!supertrackAreaNames.has(areaName)) {
-          delete supertrackRoundRobinNext[areaName];
-          stateChanged = true;
-        }
-      });
-
-      areas.forEach(area => {
-        if (!area.is_supertrack || !area.current_physicians.length) {
-          return;
-        }
-
-        const currentKeys = area.current_physicians.map(physicianKey);
-        if (!currentKeys.includes(supertrackRoundRobinNext[area.name])) {
-          supertrackRoundRobinNext[area.name] = currentKeys[0];
-          stateChanged = true;
-        }
-      });
-
-      if (stateChanged && isLocalRoundRobinMode()) {
-        saveLocalRoundRobinState();
-      }
-    }
-
     // ── Render ─────────────────────────────────────────────────────
 
     function renderAreas(areas) {
       const grid = document.getElementById('areas-grid');
       lastAreas = areas;
-      reconcileRoundRobinState(areas);
 
       if (!areas.length) {
         grid.innerHTML = '<p style="color:#8b949e;padding:1rem;">No shift data available for today.</p>';
@@ -428,24 +363,24 @@
         // Current physicians
         let currentHTML;
         if (area.current_physicians.length) {
-          const rrKey = area.name;
-          const currentKeys = area.current_physicians.map(physicianKey);
-          const activeKey = currentKeys.includes(supertrackRoundRobinNext[rrKey])
-            ? supertrackRoundRobinNext[rrKey]
-            : currentKeys[0];
-
           const items = area.current_physicians.map(p => `
-            <li class="physician-item ${area.is_supertrack ? 'supertrack-rr' : ''}"
-                ${area.is_supertrack ? `data-area-name="${esc(area.name)}" data-phys-key="${esc(physicianKey(p))}"` : ''}>
+            <li class="physician-item"
+                data-shift-key="${esc(p.shift_key)}">
               ${area.is_supertrack
-                ? (activeKey === physicianKey(p)
+                ? (supertrackState[area.name] === `${p.name}|${p.shift_start}|${p.shift_end}`
                   ? '<span class="next-triangle" title="Next in line">&#9650;</span>'
                   : '<span class="next-triangle placeholder">&#9650;</span>')
                 : ''}
-              <span class="physician-name">${esc(p.name)}</span>
-              <span class="shift-time">${esc(p.shift_start)}–${esc(p.shift_end)}</span>
+              <div class="physician-summary">
+                <span class="physician-name">${esc(p.name)}</span>
+                <span class="shift-time">${esc(p.shift_start)}-${esc(p.shift_end)}</span>
+              </div>
+              <div class="physician-stats">
+                <span>Patients assigned<span class="stat-value patient-count" title="Double-click to edit">${esc(String(p.patients_assigned))}</span></span>
+                <span>Patients/hour<span class="stat-value">${esc(String(p.patients_per_hour))}</span></span>
+              </div>
             </li>`).join('');
-          currentHTML = `<ul class="physician-list">${items}</ul>${area.is_supertrack ? '<div class="rr-hint">Click the current physician to advance next assignment.</div>' : ''}`;
+          currentHTML = `<ul class="physician-list">${items}</ul>${area.is_supertrack ? '<div class="rr-hint">Next up is selected from patient rate and time on shift.</div>' : ''}`;
         } else {
           currentHTML = '<p class="empty-msg">No physicians currently on shift</p>';
         }
@@ -476,32 +411,59 @@
           </div>`;
       }).join('');
 
-      // Supertrack-only round robin: clicking the current physician advances the marker.
-      grid.querySelectorAll('.physician-item.supertrack-rr').forEach(item => {
+      grid.querySelectorAll('.physician-item').forEach(item => {
         item.addEventListener('click', () => {
-          const areaName = item.dataset.areaName;
-          const physKey = item.dataset.physKey;
-          if (!areaName || !physKey) return;
+          const shiftKey = item.dataset.shiftKey;
+          if (!shiftKey || assignmentPending) return;
+          assignmentPending = true;
+          item.classList.add('pending');
+          socket.emit('record_assignment', { shift_key: shiftKey });
+        });
+      });
 
-          const area = lastAreas.find(a => a.name === areaName);
-          if (!area || !Array.isArray(area.current_physicians) || !area.current_physicians.length) return;
+      grid.querySelectorAll('.patient-count').forEach(count => {
+        count.addEventListener('click', event => event.stopPropagation());
+        count.addEventListener('dblclick', event => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (count.querySelector('input')) return;
 
-          const keys = area.current_physicians.map(physicianKey);
-          const clickedIdx = keys.indexOf(physKey);
-          if (clickedIdx === -1) return;
+          const item = count.closest('.physician-item');
+          const input = document.createElement('input');
+          input.className = 'patient-count-input';
+          input.type = 'number';
+          input.min = '0';
+          input.step = '1';
+          input.value = count.textContent.trim();
+          count.replaceChildren(input);
+          input.focus();
+          input.select();
 
-          if (isLocalRoundRobinMode()) {
-            const nextIdx = (clickedIdx + 1) % keys.length;
-            supertrackRoundRobinNext[areaName] = keys[nextIdx];
-            saveLocalRoundRobinState();
-            renderAreas(lastAreas);
-            return;
-          }
+          let committed = false;
+          const commit = () => {
+            if (committed) return;
+            committed = true;
+            const value = Number(input.value);
+            if (!Number.isInteger(value) || value < 0) {
+              renderAreas(lastAreas);
+              return;
+            }
+            assignmentPending = true;
+            socket.emit('set_assignment_count', {
+              shift_key: item.dataset.shiftKey,
+              patients_assigned: value,
+            });
+          };
 
-          socket.emit('advance_supertrack', {
-            area_name: areaName,
-            phys_key: physKey,
+          input.addEventListener('click', event => event.stopPropagation());
+          input.addEventListener('keydown', event => {
+            if (event.key === 'Enter') commit();
+            if (event.key === 'Escape') {
+              committed = true;
+              renderAreas(lastAreas);
+            }
           });
+          input.addEventListener('blur', commit);
         });
       });
     }
@@ -528,9 +490,7 @@
           errorBanner.style.display = 'block';
         }
 
-        if (!isLocalRoundRobinMode()) {
-          setSupertrackState(data.supertrack_state || {});
-        }
+        supertrackState = data.supertrack_state || {};
         renderAreas(data.areas || []);
 
         const updated = data.last_updated
@@ -560,46 +520,22 @@
       fetchRoster().finally(scheduleRefresh);
     });
 
-    document.getElementById('rr-mode-select').addEventListener('change', event => {
-      const nextMode = event.target.value === RR_MODE_LOCAL ? RR_MODE_LOCAL : RR_MODE_SYNC;
-
-      if (nextMode === roundRobinMode) {
-        return;
-      }
-
-      setRoundRobinMode(nextMode);
-
-      if (nextMode === RR_MODE_LOCAL) {
-        saveLocalRoundRobinState();
-        if (lastAreas.length) {
-          renderAreas(lastAreas);
-        }
-        return;
-      }
-
-      fetchRoster().finally(scheduleRefresh);
+    socket.on('roster_updated', payload => {
+      assignmentPending = false;
+      if (!payload || !Array.isArray(payload.areas)) return;
+      supertrackState = payload.supertrack_state || {};
+      renderAreas(payload.areas);
     });
 
-    socket.on('supertrack_state_updated', payload => {
-      if (isLocalRoundRobinMode()) {
-        return;
-      }
-
-      if (!payload || typeof payload.area_name !== 'string') return;
-
-      if (typeof payload.phys_key === 'string') {
-        supertrackRoundRobinNext[payload.area_name] = payload.phys_key;
-      } else {
-        delete supertrackRoundRobinNext[payload.area_name];
-      }
-
-      if (lastAreas.length) {
-        renderAreas(lastAreas);
-      }
+    socket.on('assignment_error', payload => {
+      assignmentPending = false;
+      const errorBanner = document.getElementById('error-banner');
+      errorBanner.textContent = `Warning: ${(payload && payload.message) || 'Unable to update assignment.'}`;
+      errorBanner.style.display = 'block';
+      if (lastAreas.length) renderAreas(lastAreas);
     });
 
     // Initial load
-    setRoundRobinMode(roundRobinMode);
     fetchRoster().finally(scheduleRefresh);
   </script>
 </body>

@@ -62,6 +62,16 @@ def _ensure_state_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS physician_assignment_state (
+                shift_key TEXT PRIMARY KEY,
+                patients_assigned INTEGER NOT NULL DEFAULT 0
+                    CHECK (patients_assigned >= 0),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -265,6 +275,123 @@ def _physician_key(record):
     return f"{record.get('name', '')}|{record.get('shift_start', '')}|{record.get('shift_end', '')}"
 
 
+def _shift_key(provider_id, start_dt, end_dt):
+    return f"{provider_id}|{start_dt.isoformat()}|{end_dt.isoformat()}"
+
+
+def _get_assignment_counts(shift_keys):
+    if not shift_keys:
+        return {}
+
+    placeholders = ", ".join("?" for _ in shift_keys)
+    try:
+        with _state_db_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT shift_key, patients_assigned
+                FROM physician_assignment_state
+                WHERE shift_key IN ({placeholders})
+                """,
+                shift_keys,
+            ).fetchall()
+        return {shift_key: patients_assigned for shift_key, patients_assigned in rows}
+    except Exception as exc:
+        logger.warning("State DB read failed for assignment counts: %s", exc)
+        return {}
+
+
+def _increment_assignment_count(shift_key):
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO physician_assignment_state
+                    (shift_key, patients_assigned, updated_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(shift_key) DO UPDATE SET
+                    patients_assigned = patients_assigned + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (shift_key, datetime.now().isoformat()),
+            )
+            row = conn.execute(
+                """
+                SELECT patients_assigned
+                FROM physician_assignment_state
+                WHERE shift_key = ?
+                """,
+                (shift_key,),
+            ).fetchone()
+            conn.commit()
+    return row[0]
+
+
+def _set_assignment_count(shift_key, patients_assigned):
+    if not isinstance(patients_assigned, int) or patients_assigned < 0:
+        raise ValueError("Patient count must be a non-negative whole number.")
+
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO physician_assignment_state
+                    (shift_key, patients_assigned, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(shift_key) DO UPDATE SET
+                    patients_assigned = excluded.patients_assigned,
+                    updated_at = excluded.updated_at
+                """,
+                (shift_key, patients_assigned, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+
+def _patients_per_hour(patients_assigned, shift_start, now):
+    elapsed_hours = (now - shift_start).total_seconds() / 3600
+    if elapsed_hours <= 0:
+        return 0.0
+    return round(patients_assigned / max(elapsed_hours, 1.0), 1)
+
+
+def _supertrack_phase_multiplier(shift_start, now):
+    elapsed_hours = (now - shift_start).total_seconds() / 3600
+    if elapsed_hours < 1:
+        return 0.5
+    if elapsed_hours < 2:
+        return 1.0
+    if elapsed_hours < 4:
+        return 1.25
+    if elapsed_hours < 5:
+        return 1.75
+    return 2.5
+
+
+def _weighted_supertrack_next(physicians, current_key, now):
+    if not physicians:
+        return None
+
+    scores = {
+        _physician_key(physician): (
+            physician["patients_per_hour"]
+            * _supertrack_phase_multiplier(physician["_shift_start"], now)
+        )
+        for physician in physicians
+    }
+    lowest_score = min(scores.values())
+    tied_keys = {
+        key for key, score in scores.items() if score == lowest_score
+    }
+    keys = [_physician_key(physician) for physician in physicians]
+
+    if current_key in keys:
+        start_index = keys.index(current_key)
+        ordered_keys = keys[start_index:] + keys[:start_index]
+    else:
+        ordered_keys = keys
+
+    return next(key for key in ordered_keys if key in tied_keys)
+
+
 def _get_supertrack_indicator_key(date_key, area_name):
     try:
         with _state_db_conn() as conn:
@@ -316,7 +443,7 @@ def _clear_supertrack_indicator_key(date_key, area_name):
         logger.warning("State DB delete failed for supertrack state: %s", exc)
 
 
-def _hydrate_supertrack_state(areas, date_key):
+def _hydrate_supertrack_state(areas, date_key, now):
     supertrack_state = {}
 
     for area in areas:
@@ -331,11 +458,13 @@ def _hydrate_supertrack_state(areas, date_key):
             continue
 
         current_key = _get_supertrack_indicator_key(date_key, area_name)
-        if not current_key or current_key not in keys:
-            current_key = keys[0]
-            _set_supertrack_indicator_key(date_key, area_name, current_key)
+        next_key = _weighted_supertrack_next(
+            area.get("current_physicians", []), current_key, now
+        )
+        if next_key != current_key:
+            _set_supertrack_indicator_key(date_key, area_name, next_key)
 
-        supertrack_state[area_name] = current_key
+        supertrack_state[area_name] = next_key
 
     return supertrack_state
 
@@ -432,10 +561,13 @@ def build_roster():
                     "current_physicians": [],
                     "arriving_soon": [],
                 }
+            provider_id = shift.get("user_id") or shift.get("provider_id") or name
             areas[area_key]["current_physicians"].append({
                 "name": name,
                 "shift_start": start_dt.strftime("%H:%M"),
                 "shift_end": end_dt.strftime("%H:%M"),
+                "shift_key": _shift_key(provider_id, start_dt, end_dt),
+                "_shift_start": start_dt,
             })
         elif now < start_dt <= now + timedelta(hours=ARRIVING_SOON_WINDOW_HOURS):
             if area_key not in areas:
@@ -458,7 +590,24 @@ def build_roster():
         key=lambda a: (not a["is_supertrack"], a["name"]),
     )
 
-    supertrack_state = _hydrate_supertrack_state(sorted_areas, state_date_key)
+    current_physicians = [
+        physician
+        for area in sorted_areas
+        for physician in area["current_physicians"]
+    ]
+    assignment_counts = _get_assignment_counts(
+        [physician["shift_key"] for physician in current_physicians]
+    )
+    for physician in current_physicians:
+        patients_assigned = assignment_counts.get(physician["shift_key"], 0)
+        physician["patients_assigned"] = patients_assigned
+        physician["patients_per_hour"] = _patients_per_hour(
+            patients_assigned, physician["_shift_start"], now
+        )
+
+    supertrack_state = _hydrate_supertrack_state(sorted_areas, state_date_key, now)
+    for physician in current_physicians:
+        del physician["_shift_start"]
     return {
         "areas": sorted_areas,
         "last_updated": now.isoformat(),
@@ -478,54 +627,78 @@ def api_roster():
     return jsonify(build_roster())
 
 
-@socketio.on("advance_supertrack")
-def handle_advance_supertrack(payload):
-    area_name = (payload or {}).get("area_name")
-    phys_key = (payload or {}).get("phys_key")
-    if not isinstance(area_name, str) or not isinstance(phys_key, str):
-        emit("advance_error", {"message": "Invalid supertrack advance payload."})
+def _find_active_physician(roster, shift_key):
+    for area in roster.get("areas", []):
+        for physician in area.get("current_physicians", []):
+            if physician.get("shift_key") == shift_key:
+                return area, physician
+    return None, None
+
+
+def _emit_roster_update():
+    roster = build_roster()
+    if "error" in roster:
+        socketio.emit("assignment_error", {
+            "message": "Unable to refresh roster after updating assignment state."
+        })
+        return
+    socketio.emit("roster_updated", roster)
+
+
+@socketio.on("record_assignment")
+def handle_record_assignment(payload):
+    shift_key = (payload or {}).get("shift_key")
+    if not isinstance(shift_key, str):
+        emit("assignment_error", {"message": "Invalid assignment payload."})
         return
 
     roster = build_roster()
     if "error" in roster:
-        emit("advance_error", {"message": "Unable to update indicator while roster API is unavailable."})
+        emit("assignment_error", {
+            "message": "Unable to record an assignment while the roster API is unavailable."
+        })
         return
 
-    date_key = datetime.now().date().isoformat()
-    area = next(
-        (
-            item
-            for item in roster.get("areas", [])
-            if item.get("is_supertrack") and item.get("name") == area_name
-        ),
-        None,
-    )
-    if area is None:
-        emit("advance_error", {"message": "Supertrack area was not found."})
+    _, physician = _find_active_physician(roster, shift_key)
+    if physician is None:
+        emit("assignment_error", {
+            "message": "That physician is no longer active on the roster."
+        })
         return
 
-    keys = [_physician_key(p) for p in area.get("current_physicians", [])]
-    if not keys:
-        _clear_supertrack_indicator_key(date_key, area_name)
-        socketio.emit(
-            "supertrack_state_updated",
-            {"area_name": area_name, "phys_key": None},
-        )
+    _increment_assignment_count(shift_key)
+    _emit_roster_update()
+
+
+@socketio.on("set_assignment_count")
+def handle_set_assignment_count(payload):
+    shift_key = (payload or {}).get("shift_key")
+    patients_assigned = (payload or {}).get("patients_assigned")
+    if not isinstance(shift_key, str) or isinstance(patients_assigned, bool):
+        emit("assignment_error", {"message": "Invalid assignment correction payload."})
         return
 
-    if phys_key not in keys:
-        phys_key = _get_supertrack_indicator_key(date_key, area_name)
-        if phys_key not in keys:
-            phys_key = keys[0]
+    roster = build_roster()
+    if "error" in roster:
+        emit("assignment_error", {
+            "message": "Unable to update an assignment while the roster API is unavailable."
+        })
+        return
 
-    next_idx = (keys.index(phys_key) + 1) % len(keys)
-    next_key = keys[next_idx]
-    _set_supertrack_indicator_key(date_key, area_name, next_key)
+    _, physician = _find_active_physician(roster, shift_key)
+    if physician is None:
+        emit("assignment_error", {
+            "message": "That physician is no longer active on the roster."
+        })
+        return
 
-    socketio.emit(
-        "supertrack_state_updated",
-        {"area_name": area_name, "phys_key": next_key},
-    )
+    try:
+        _set_assignment_count(shift_key, patients_assigned)
+    except ValueError as exc:
+        emit("assignment_error", {"message": str(exc)})
+        return
+
+    _emit_roster_update()
 
 
 if __name__ == "__main__":

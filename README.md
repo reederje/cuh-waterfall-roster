@@ -54,7 +54,7 @@ Notes:
 
 - `SHIFTADMIN_USER` and `SHIFTADMIN_PASSWORD` are used for calls to ShiftAdmin.
 - `AUTH_PASSWORD` is required for HTTP Basic Auth on the roster endpoints.
-- `STATE_DB_PATH` is the on-disk SQLite file used for shared Supertrack indicator state.
+- `STATE_DB_PATH` is the on-disk SQLite file used for shared assignment counts and the Supertrack next-up indicator.
 - The Basic Auth username is fixed in code as `cuhed`.
 - Set `FLASK_DEBUG=1` for local debug mode.
 
@@ -79,6 +79,26 @@ When prompted for credentials in the browser:
 python -m pytest -q
 ```
 
+Run the deterministic Supertrack allocation simulation and show the per-shift
+patient totals:
+
+```bash
+python -m pytest tests/test_app.py::test_supertrack_day_simulation -q -s
+```
+
+The simulation covers 6:00 AM through 5:59 AM using the configured daily
+arrival pattern and Supertrack shift schedule. It also reports arrivals that
+have no eligible physician during the six-hour Supertrack assignment window.
+
 ## API endpoint
 
-- `GET /api/roster` returns the roster JSON payload.
+- `GET /api/roster` returns the roster JSON payload. Each active physician includes:
+	- `shift_key`: identifier for that scheduled shift.
+	- `patients_assigned`: shared assignment total for the shift.
+	- `patients_per_hour`: assignment total divided by elapsed shift time, rounded to one decimal. The first hour uses a one-hour minimum denominator to avoid inflated rates for newly started shifts.
+
+## Assignment tracking
+
+- Click an active physician card to record a patient assignment. Counts and the Supertrack next-up indicator are shared across connected users.
+- Double-click a physician's patient total to correct it. Press Enter or click elsewhere to commit the value; press Escape to cancel.
+- Supertrack physicians are eligible for their first six hours. The next-up physician has the lowest weighted patient rate: the first two active hours use a $1.0$ multiplier, hours two through four use $1.5$, and hours four through six use $2.0$. Equal scores use the existing roster order as a stable tie-breaker.
