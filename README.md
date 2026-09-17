@@ -128,9 +128,23 @@ have no eligible physician during the six-hour Supertrack assignment window.
 	- `shift_key`: identifier for that scheduled shift.
 	- `patients_assigned`: shared assignment total for the shift.
 	- `patients_per_hour`: assignment total divided by elapsed shift time, rounded to one decimal. The first hour uses a one-hour minimum denominator to avoid inflated rates for newly started shifts.
+- The payload also includes a `next_up` field describing the current rotation recommendation: `{"type": "physician", "area_name": ..., "phys_key": ...}` when a Supertrack physician is next, or `{"type": "area", "area_name": "Gray"|"Purple"}` when a whole pod is next.
 
 ## Assignment tracking
 
 - Click an active physician card to record a patient assignment. Counts and the Supertrack next-up indicator are shared across connected users.
 - Double-click a physician's patient total to correct it. Press Enter or click elsewhere to commit the value; press Escape to cancel.
 - Supertrack physicians are eligible for their first six hours. The **Next-up method** control switches between **Phase weighting**, which uses the configured phase multipliers, and **Strict round robin**, which advances sequentially through eligible physicians after each assignment. The selected method is shared across connected users and persisted in SQLite.
+
+## Gray & Purple pod rotation
+
+- Gray and Purple pods share the same overall "next up" rotation as Supertrack, but they participate as a single unit rather than per physician: each current Supertrack physician counts as one rotation entry, and each non-empty Gray or Purple pod counts as exactly one entry regardless of how many physicians are working in it.
+- For example, 3 Supertrack physicians plus a 1-physician Gray pod and a 2-physician Purple pod produce 5 total rotation entries, so Gray and Purple pods each come up once every 5 new assignments.
+- When it is a pod's turn, the whole area card is highlighted with a **NEXT UP** badge instead of marking an individual physician.
+- Gray and Purple pods do not display the "Patients assigned" or "Patients/hour" stats in the UI; those counts are still tracked internally for correction/history purposes, they are just not shown for these two pods.
+
+## Skip next up
+
+- Click **⏭ Skip next up** to pass on the current recommendation without recording a patient assignment.
+- The rotation immediately excludes whoever was marked next up (a physician or an entire pod) and re-selects from the remaining eligible physicians/pods.
+- Skipped entities are not penalized: their patient counts are unchanged, and they become eligible again as soon as any new assignment is recorded.

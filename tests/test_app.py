@@ -670,3 +670,189 @@ def test_supertrack_day_simulation():
         f"({[arrival.strftime('%H:%M') for arrival in unassigned_arrivals]})"
     )
     assert sum(totals.values()) + len(unassigned_arrivals) == sum(hourly_arrivals)
+
+
+# ── Gray/Purple pod "next up" rotation ──────────────────────────────────────
+
+def _pod_roster_shifts(num_supertrack=3, num_gray=1, num_purple=2):
+    shifts = []
+    for i in range(num_supertrack):
+        shifts.append(_make_shift(
+            "ST Pods", start_offset_minutes=-30, end_offset_minutes=30,
+            user_id=f"st{i}", user_name=f"ST-{i}",
+        ))
+    for i in range(num_gray):
+        shifts.append(_make_shift(
+            "Gray Fast Track", start_offset_minutes=-30, end_offset_minutes=30,
+            user_id=f"gray{i}", user_name=f"Gray-{i}",
+        ))
+    for i in range(num_purple):
+        shifts.append(_make_shift(
+            "Purple Pod", start_offset_minutes=-30, end_offset_minutes=30,
+            user_id=f"purple{i}", user_name=f"Purple-{i}",
+        ))
+    return {"scheduled_shifts": shifts}
+
+
+def test_build_rotation_slots_counts_pods_as_a_single_unit():
+    """3 Supertrack physicians + 1-physician Gray pod + 2-physician Purple
+    pod should yield 5 total rotation slots (Gray and Purple count once)."""
+    shifts = _pod_roster_shifts(num_supertrack=3, num_gray=1, num_purple=2)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+
+    slots = flask_app._build_rotation_slots(roster["areas"])
+    assert slots.count("supertrack") == 3
+    assert slots.count("Gray") == 1
+    assert slots.count("Purple") == 1
+    assert len(slots) == 5
+
+
+def test_build_rotation_slots_excludes_empty_pods():
+    shifts = _pod_roster_shifts(num_supertrack=2, num_gray=0, num_purple=1)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+
+    slots = flask_app._build_rotation_slots(roster["areas"])
+    assert slots.count("supertrack") == 2
+    assert "Gray" not in slots
+    assert slots.count("Purple") == 1
+    assert len(slots) == 3
+
+
+def test_next_up_cycles_through_pods_and_supertrack_proportionally():
+    """Over a full 5-slot cycle, Gray and Purple should each be "next up"
+    exactly once, matching their 1-in-5 share of the rotation."""
+    shifts = _pod_roster_shifts(num_supertrack=3, num_gray=1, num_purple=2)
+    date_key = datetime.now().date().isoformat()
+
+    next_up_types = []
+    for _ in range(5):
+        with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+            roster = flask_app.build_roster()
+        next_up_types.append(
+            roster["next_up"]["area_name"] if roster["next_up"]["type"] == "area"
+            else "supertrack"
+        )
+        flask_app._advance_rotation_counter(date_key)
+
+    assert next_up_types.count("Gray") == 1
+    assert next_up_types.count("Purple") == 1
+    assert next_up_types.count("supertrack") == 3
+
+
+def test_gray_pod_next_up_marks_whole_area_not_a_physician():
+    shifts = _pod_roster_shifts(num_supertrack=0, num_gray=1, num_purple=0)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+
+    assert roster["next_up"] == {"type": "area", "area_name": "Gray"}
+
+
+def test_record_assignment_in_gray_pod_advances_rotation_counter():
+    shifts = _pod_roster_shifts(num_supertrack=1, num_gray=1, num_purple=0)
+    date_key = datetime.now().date().isoformat()
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        gray_area = next(a for a in roster["areas"] if a["name"] == "Gray")
+        shift_key = gray_area["current_physicians"][0]["shift_key"]
+
+        assert flask_app._get_rotation_counter(date_key) == 0
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": shift_key})
+        socket_client.get_received()
+
+    assert flask_app._get_rotation_counter(date_key) == 1
+
+
+def test_record_assignment_outside_rotation_areas_does_not_advance_counter():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
+    ]}
+    date_key = datetime.now().date().isoformat()
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        physician = roster["areas"][0]["current_physicians"][0]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": physician["shift_key"]})
+        socket_client.get_received()
+
+    assert flask_app._get_rotation_counter(date_key) == 0
+
+
+# ── Skip next up ─────────────────────────────────────────────────────────
+
+def test_skip_next_up_picks_a_different_supertrack_physician():
+    shifts = _pod_roster_shifts(num_supertrack=3, num_gray=0, num_purple=0)
+    flask_app._set_selection_mode("strict_round_robin")
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        first_pick = roster["next_up"]["phys_key"]
+
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+        received = socket_client.get_received()
+
+    updates = [event for event in received if event["name"] == "roster_updated"]
+    assert len(updates) == 1
+    second_pick = updates[0]["args"][0]["next_up"]["phys_key"]
+    assert second_pick != first_pick
+
+
+def test_skip_next_up_does_not_increment_patient_count():
+    shifts = _pod_roster_shifts(num_supertrack=2, num_gray=0, num_purple=0)
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        skipped_key = roster["next_up"]["phys_key"]
+        skipped_physician = next(
+            p for p in roster["areas"][0]["current_physicians"]
+            if flask_app._physician_key(p) == skipped_key
+        )
+
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+        received = socket_client.get_received()
+
+    updates = [event for event in received if event["name"] == "roster_updated"]
+    updated_physician = next(
+        p for p in updates[0]["args"][0]["areas"][0]["current_physicians"]
+        if p["shift_key"] == skipped_physician["shift_key"]
+    )
+    assert updated_physician["patients_assigned"] == 0
+
+
+def test_skip_next_up_on_pod_moves_to_next_area():
+    shifts = _pod_roster_shifts(num_supertrack=0, num_gray=1, num_purple=1)
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        assert roster["next_up"] == {"type": "area", "area_name": "Gray"}
+
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+        received = socket_client.get_received()
+
+    updates = [event for event in received if event["name"] == "roster_updated"]
+    assert updates[0]["args"][0]["next_up"] == {"type": "area", "area_name": "Purple"}
+
+
+def test_real_assignment_clears_skip_state():
+    shifts = _pod_roster_shifts(num_supertrack=2, num_gray=0, num_purple=0)
+    date_key = datetime.now().date().isoformat()
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        physician = roster["areas"][0]["current_physicians"][0]
+
+        flask_app._add_skipped_key(date_key, flask_app._physician_key(physician))
+        assert flask_app._get_skipped_keys(date_key) == {flask_app._physician_key(physician)}
+
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": physician["shift_key"]})
+        socket_client.get_received()
+
+    assert flask_app._get_skipped_keys(date_key) == set()

@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import os
 import sqlite3
@@ -29,6 +30,9 @@ COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
 SUPERTRACK_SELECTION_MODES = ("phase_multiplier", "strict_round_robin")
 DEFAULT_SUPERTRACK_SELECTION_MODE = "phase_multiplier"
+# Pod areas (besides Supertrack) that participate in the "next up" rotation
+# as a single unit, rather than per-physician.
+ROTATION_POD_AREAS = ("Gray", "Purple")
 
 # Most recent ShiftAdmin request error details, used to provide diagnostics
 # in API responses.
@@ -79,6 +83,24 @@ def _ensure_state_db():
             CREATE TABLE IF NOT EXISTS supertrack_settings (
                 setting_key TEXT PRIMARY KEY,
                 setting_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rotation_state (
+                date_key TEXT PRIMARY KEY,
+                counter INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skip_state (
+                date_key TEXT PRIMARY KEY,
+                skipped_keys TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -501,30 +523,156 @@ def _clear_supertrack_indicator_key(date_key, area_name):
         logger.warning("State DB delete failed for supertrack state: %s", exc)
 
 
+def _get_rotation_counter(date_key):
+    try:
+        with _state_db_conn() as conn:
+            row = conn.execute(
+                "SELECT counter FROM rotation_state WHERE date_key = ?",
+                (date_key,),
+            ).fetchone()
+        return row[0] if row else 0
+    except Exception as exc:
+        logger.warning("State DB read failed for rotation counter: %s", exc)
+        return 0
+
+
+def _advance_rotation_counter(date_key):
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO rotation_state (date_key, counter, updated_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(date_key) DO UPDATE SET
+                    counter = counter + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (date_key, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+
+def _build_rotation_slots(areas):
+    """Build the ordered set of "next up" rotation entries: one slot per
+    current Supertrack physician, plus one slot per non-empty pod area
+    (Gray, Purple) regardless of how many physicians are in that pod."""
+    slots = []
+
+    supertrack_area = next((area for area in areas if area.get("is_supertrack")), None)
+    if supertrack_area:
+        slots.extend(["supertrack"] * len(supertrack_area.get("current_physicians", [])))
+
+    pod_areas = sorted(
+        (
+            area for area in areas
+            if area.get("name") in ROTATION_POD_AREAS and area.get("current_physicians")
+        ),
+        key=lambda area: area["name"],
+    )
+    slots.extend(area["name"] for area in pod_areas)
+
+    return slots
+
+
+def _get_skipped_keys(date_key):
+    try:
+        with _state_db_conn() as conn:
+            row = conn.execute(
+                "SELECT skipped_keys FROM skip_state WHERE date_key = ?",
+                (date_key,),
+            ).fetchone()
+        if row:
+            return set(json.loads(row[0]))
+    except Exception as exc:
+        logger.warning("State DB read failed for skip state: %s", exc)
+    return set()
+
+
+def _add_skipped_key(date_key, key):
+    with _STATE_DB_LOCK:
+        skipped = _get_skipped_keys(date_key)
+        skipped.add(key)
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO skip_state (date_key, skipped_keys, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(date_key) DO UPDATE SET
+                    skipped_keys = excluded.skipped_keys,
+                    updated_at = excluded.updated_at
+                """,
+                (date_key, json.dumps(sorted(skipped)), datetime.now().isoformat()),
+            )
+            conn.commit()
+
+
+def _clear_skipped_keys(date_key):
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute("DELETE FROM skip_state WHERE date_key = ?", (date_key,))
+            conn.commit()
+
+
 def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
+    """Update each area's own indicator state and determine which entity
+    (a Supertrack physician, or an entire pod area) is next up overall.
+    Entries recorded in skip_state are excluded from being chosen."""
     supertrack_state = {}
+    skipped_keys = _get_skipped_keys(date_key)
 
     for area in areas:
         if not area.get("is_supertrack"):
             continue
 
         area_name = area.get("name", "")
-        keys = [_physician_key(p) for p in area.get("current_physicians", [])]
+        all_physicians = area.get("current_physicians", [])
+        keys = [_physician_key(p) for p in all_physicians]
 
         if not keys:
             _clear_supertrack_indicator_key(date_key, area_name)
             continue
 
+        eligible_physicians = [
+            physician for physician in all_physicians
+            if _physician_key(physician) not in skipped_keys
+        ] or all_physicians
+
         current_key = _get_supertrack_indicator_key(date_key, area_name)
         next_key = _weighted_supertrack_next(
-            area.get("current_physicians", []), current_key, now, selection_mode
+            eligible_physicians, current_key, now, selection_mode
         )
         if next_key != current_key:
             _set_supertrack_indicator_key(date_key, area_name, next_key)
 
         supertrack_state[area_name] = next_key
 
-    return supertrack_state
+    slots = _build_rotation_slots(areas)
+    if not slots:
+        return supertrack_state, None
+
+    counter = _get_rotation_counter(date_key)
+    num_slots = len(slots)
+    chosen = None
+    for offset in range(num_slots):
+        candidate = slots[(counter + offset) % num_slots]
+        if candidate == "supertrack" or candidate not in skipped_keys:
+            chosen = candidate
+            break
+    if chosen is None:
+        chosen = slots[counter % num_slots]
+
+    if chosen == "supertrack":
+        supertrack_area = next((area for area in areas if area.get("is_supertrack")), None)
+        area_name = supertrack_area.get("name", "Supertrack") if supertrack_area else "Supertrack"
+        next_up = {
+            "type": "physician",
+            "area_name": area_name,
+            "phys_key": supertrack_state.get(area_name),
+        }
+    else:
+        next_up = {"type": "area", "area_name": chosen}
+
+    return supertrack_state, next_up
 
 
 def build_roster():
@@ -664,7 +812,7 @@ def build_roster():
         )
 
     selection_mode = _get_selection_mode()
-    supertrack_state = _hydrate_supertrack_state(
+    supertrack_state, next_up = _hydrate_supertrack_state(
         sorted_areas, state_date_key, now, selection_mode
     )
     for physician in current_physicians:
@@ -674,6 +822,7 @@ def build_roster():
         "last_updated": now.isoformat(),
         "supertrack_state": supertrack_state,
         "supertrack_selection_mode": selection_mode,
+        "next_up": next_up,
     }
 
 
@@ -740,6 +889,10 @@ def handle_record_assignment(payload):
         return
 
     _increment_assignment_count(shift_key)
+    if area and (area.get("is_supertrack") or area.get("name") in ROTATION_POD_AREAS):
+        _advance_rotation_counter(datetime.now().date().isoformat())
+    # A real assignment ends the current round, so skipped entities are eligible again.
+    _clear_skipped_keys(datetime.now().date().isoformat())
     if area and area.get("is_supertrack"):
         keys = [
             _physician_key(item)
@@ -754,6 +907,29 @@ def handle_record_assignment(payload):
                 datetime.now().date().isoformat(), area["name"]
             ),
         )
+    _emit_roster_update()
+
+
+@socketio.on("skip_next_up")
+def handle_skip_next_up(payload=None):
+    roster = build_roster()
+    if "error" in roster:
+        emit("assignment_error", {
+            "message": "Unable to skip while the roster API is unavailable."
+        })
+        return
+
+    next_up = roster.get("next_up")
+    if not next_up:
+        emit("assignment_error", {"message": "There is no next up selection to skip."})
+        return
+
+    skip_key = next_up.get("phys_key") if next_up.get("type") == "physician" else next_up.get("area_name")
+    if not skip_key:
+        emit("assignment_error", {"message": "Unable to determine who to skip."})
+        return
+
+    _add_skipped_key(datetime.now().date().isoformat(), skip_key)
     _emit_roster_update()
 
 

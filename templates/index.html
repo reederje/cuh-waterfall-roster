@@ -75,6 +75,20 @@
     #refresh-btn:hover { background: #2ea043; }
     #refresh-btn:disabled { background: #444; cursor: default; }
 
+    #skip-btn {
+      background: #8957e5;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.45rem 1rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    #skip-btn:hover { background: #a371f7; }
+    #skip-btn:disabled { background: #444; cursor: default; }
+
     #help-btn {
       background: #58a6ff;
       color: #0d1117;
@@ -264,6 +278,26 @@
       letter-spacing: 0.05em;
     }
 
+    .area-card.next-up-pod {
+      border-color: #d29922;
+    }
+
+    .next-up-pod .area-header {
+      background: #2d2008;
+      color: #f0b429;
+    }
+
+    .badge-next {
+      background: #d29922;
+      color: #0d1117;
+      font-size: 0.65rem;
+      font-weight: 800;
+      border-radius: 4px;
+      padding: 0.1rem 0.35rem;
+      letter-spacing: 0.05em;
+      margin-left: auto;
+    }
+
     /* ── Physicians list ─────────────────────────────────────────── */
     .area-body {
       padding: 0.6rem 0.85rem;
@@ -447,6 +481,7 @@
       </select>
     </div>
     <button id="help-btn">? Help</button>
+    <button id="skip-btn" title="Skip the current next-up pick without assigning them a patient">⏭ Skip next up</button>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -494,8 +529,8 @@
             <strong>Currently present</strong> — Physicians actively on shift right now
           </div>
           <ul>
-            <li><strong>Physicians assigned</strong> — Number of patients this physician is currently managing</li>
-            <li><strong>Patients/hour</strong> — Calculated average based on shift duration and assignments</li>
+            <li><strong>Physicians assigned</strong> — Number of patients this physician is currently managing (hidden for Gray and Purple pods, see below)</li>
+            <li><strong>Patients/hour</strong> — Calculated average based on shift duration and assignments (also hidden for Gray and Purple pods)</li>
             <li><strong>Shift time</strong> — Their scheduled shift hours (e.g., 08:00-16:00)</li>
           </ul>
         </div>
@@ -510,8 +545,28 @@
           <p>Areas marked with a <span class="instructions-code">ST</span> badge use Supertrack logic:</p>
           <ul>
             <li><strong>Upward triangle (▲)</strong> — This physician is next in the rotation</li>
-            <li>Next assignments are selected based on patient rate and time spent on shift</li>
+            <li>Next assignments are selected based on patient rate and time spent on shift, or by strict round robin, depending on the selected mode</li>
             <li>This ensures fair distribution across the team</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>🩶 Gray &amp; Purple Pod Rotation</h3>
+          <p>Gray and Purple pods share the same overall "next up" rotation as Supertrack, but as a whole area rather than an individual physician:</p>
+          <ul>
+            <li>Each Supertrack physician counts as one entry in the rotation; each non-empty Gray or Purple pod counts as exactly one entry, regardless of how many physicians are working in it</li>
+            <li>For example, with 3 Supertrack physicians, 1 Gray physician, and 2 Purple physicians, there are 5 total rotation entries — Gray and Purple each come up once every 5 assignments</li>
+            <li>When it's a pod's turn, the whole card is highlighted with a <strong>NEXT UP</strong> badge instead of a specific physician</li>
+            <li>Gray and Purple pods do not display individual patient counts or patients/hour, since assignments there are tracked at the pod level for rotation purposes</li>
+          </ul>
+        </div>
+
+        <div class="instructions-section">
+          <h3>⏭ Skip Next Up</h3>
+          <ul>
+            <li>Click the <strong>⏭ Skip next up</strong> button to pass on the current recommendation without recording a patient assignment</li>
+            <li>The rotation immediately re-selects the next physician or pod, excluding whoever was just skipped</li>
+            <li>Skipped physicians/pods are not penalized — their patient counts stay unchanged, and they become eligible again once any new assignment is recorded</li>
           </ul>
         </div>
 
@@ -558,6 +613,7 @@
     let refreshTimer = null;
     let lastAreas = [];
     let supertrackState = {};
+    let nextUp = null;
     let assignmentPending = false;
     let selectionMode = 'phase_multiplier';
     const socket = io();
@@ -618,6 +674,13 @@
         const stBadge = area.is_supertrack
           ? '<span class="badge-st">ST</span>'
           : '';
+        const isNextUpPod = !area.is_supertrack
+          && nextUp && nextUp.type === 'area' && nextUp.area_name === area.name;
+        const podBadge = isNextUpPod
+          ? '<span class="badge-next" title="Next in line">NEXT UP</span>'
+          : '';
+        // Gray/Purple pods track patient counts internally but don't display them.
+        const hideStats = ['Gray', 'Purple'].includes(area.name);
 
         // Current physicians
         let currentHTML;
@@ -626,7 +689,8 @@
             <li class="physician-item"
                 data-shift-key="${esc(p.shift_key)}">
               ${area.is_supertrack
-                ? (supertrackState[area.name] === `${p.name}|${p.shift_start}|${p.shift_end}`
+                ? (nextUp && nextUp.type === 'physician' && nextUp.area_name === area.name
+                    && nextUp.phys_key === `${p.name}|${p.shift_start}|${p.shift_end}`
                   ? '<span class="next-triangle" title="Next in line">&#9650;</span>'
                   : '<span class="next-triangle placeholder">&#9650;</span>')
                 : ''}
@@ -634,12 +698,19 @@
                 <span class="physician-name">${esc(p.name)}</span>
                 <span class="shift-time">${esc(p.shift_start)}-${esc(p.shift_end)}</span>
               </div>
+              ${hideStats ? '' : `
               <div class="physician-stats">
                 <span>Patients assigned<span class="stat-value patient-count" title="Double-click to edit">${esc(String(p.patients_assigned))}</span></span>
                 <span>Patients/hour<span class="stat-value">${esc(String(p.patients_per_hour))}</span></span>
-              </div>
+              </div>`}
             </li>`).join('');
-          currentHTML = `<ul class="physician-list">${items}</ul>${area.is_supertrack ? '<div class="rr-hint">Next up is selected from patient rate and time on shift.</div>' : ''}`;
+          let hint = '';
+          if (area.is_supertrack) {
+            hint = '<div class="rr-hint">Next up is selected from patient rate and time on shift.</div>';
+          } else if (isNextUpPod) {
+            hint = '<div class="rr-hint">This pod is next up for a new patient.</div>';
+          }
+          currentHTML = `<ul class="physician-list">${items}</ul>${hint}`;
         } else {
           currentHTML = '<p class="empty-msg">No physicians currently on shift</p>';
         }
@@ -660,8 +731,8 @@
         }
 
         return `
-          <div class="area-card ${area.is_supertrack ? 'supertrack' : ''}">
-            <div class="area-header">${stBadge}${esc(area.name)}</div>
+          <div class="area-card ${area.is_supertrack ? 'supertrack' : ''} ${isNextUpPod ? 'next-up-pod' : ''}">
+            <div class="area-header">${stBadge}${esc(area.name)}${podBadge}</div>
             <div class="area-body">
               <div class="section-label">Currently present</div>
               ${currentHTML}
@@ -750,6 +821,7 @@
         }
 
         supertrackState = data.supertrack_state || {};
+        nextUp = data.next_up || null;
         selectionMode = data.supertrack_selection_mode || 'phase_multiplier';
         document.getElementById('selection-mode').value = selectionMode;
         renderAreas(data.areas || []);
@@ -781,10 +853,17 @@
       fetchRoster().finally(scheduleRefresh);
     });
 
+    document.getElementById('skip-btn').addEventListener('click', () => {
+      if (assignmentPending) return;
+      assignmentPending = true;
+      socket.emit('skip_next_up');
+    });
+
     socket.on('roster_updated', payload => {
       assignmentPending = false;
       if (!payload || !Array.isArray(payload.areas)) return;
       supertrackState = payload.supertrack_state || {};
+      nextUp = payload.next_up || null;
       selectionMode = payload.supertrack_selection_mode || 'phase_multiplier';
       document.getElementById('selection-mode').value = selectionMode;
       renderAreas(payload.areas);
