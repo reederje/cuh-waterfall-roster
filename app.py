@@ -389,11 +389,11 @@ def _patients_per_hour(patients_assigned, shift_start, now):
 def _supertrack_phase_multiplier(shift_start, now):
     elapsed_hours = (now - shift_start).total_seconds() / 3600
     if elapsed_hours < 1:
-        return 0.5
-    if elapsed_hours < 2:
         return 1.0
-    if elapsed_hours < 4:
+    if elapsed_hours < 2:
         return 1.25
+    if elapsed_hours < 4:
+        return 1.5
     if elapsed_hours < 5:
         return 1.75
     return 2.5
