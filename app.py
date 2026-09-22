@@ -277,6 +277,64 @@ def _is_supertrack_shift(shift_name):
     return "st" in normalized.split()
 
 
+def _supertrack_keep_overdue_keys(raw_shifts, now):
+    """Determine which past-active-window Supertrack physicians must stay.
+
+    Normally a Supertrack physician is dropped once they pass
+    SUPERTRACK_ACTIVE_WINDOW_HOURS. But dropping one should never leave
+    Supertrack with zero physicians, so an overdue physician is only
+    removed once at least one other physician (within their active
+    window, or another overdue physician who arrived later) will remain.
+    """
+    active = []  # (provider_id, start_dt) for every currently active Supertrack shift
+    overdue = []  # subset of active whose active window has elapsed
+
+    for shift in raw_shifts:
+        if not isinstance(shift, dict):
+            continue
+        if str(shift.get("facility_id", "")) != str(TARGET_FACILITY_ID):
+            continue
+        if shift.get("group_id") != 1:
+            continue
+
+        shift_name = shift.get(
+            "shift_name", shift.get("name", shift.get("shift", "Unknown"))
+        )
+        if not _is_supertrack_shift(shift_name):
+            continue
+
+        start_dt = _parse_dt(
+            shift.get("start_datetime")
+            or shift.get("start_time")
+            or shift.get("shift_start")
+            or shift.get("published_shift_start", "")
+        )
+        end_dt = _parse_dt(
+            shift.get("end_datetime")
+            or shift.get("end_time")
+            or shift.get("shift_end")
+            or shift.get("published_shift_end", "")
+        )
+        if start_dt is None or end_dt is None or not (start_dt <= now <= end_dt):
+            continue
+
+        name = _provider_name(shift)
+        provider_id = shift.get("user_id") or shift.get("provider_id") or name
+        key = (provider_id, start_dt)
+        active.append(key)
+        if now >= start_dt + timedelta(hours=SUPERTRACK_ACTIVE_WINDOW_HOURS):
+            overdue.append(key)
+
+    within_window_count = len(active) - len(overdue)
+    if within_window_count > 0 or not overdue:
+        return set()
+
+    # No one is within their active window, so keep whoever arrived most
+    # recently among the overdue physicians to avoid leaving Supertrack empty.
+    most_recent = max(overdue, key=lambda key: key[1])
+    return {most_recent}
+
+
 def _color_area_name(shift_name):
     """Return canonical color area name when the shift contains one."""
     if not shift_name:
@@ -711,6 +769,7 @@ def build_roster():
         raw_shifts = shifts_data
 
     areas = {}
+    keep_overdue_keys = _supertrack_keep_overdue_keys(raw_shifts, now)
 
     for shift in raw_shifts:
         if not isinstance(shift, dict):
@@ -754,12 +813,15 @@ def build_roster():
             continue
 
         name = _provider_name(shift)
+        provider_id = shift.get("user_id") or shift.get("provider_id") or name
 
         # Only place this physician in an area if the shift is active or
         # starting within the next hour; otherwise skip entirely.
         if start_dt <= now <= end_dt:
             if is_supertrack and now >= start_dt + timedelta(hours=SUPERTRACK_ACTIVE_WINDOW_HOURS):
-                continue
+                overdue_key = (provider_id, start_dt)
+                if overdue_key not in keep_overdue_keys:
+                    continue
             if area_key not in areas:
                 areas[area_key] = {
                     "name": area_name,
@@ -767,7 +829,6 @@ def build_roster():
                     "current_physicians": [],
                     "arriving_soon": [],
                 }
-            provider_id = shift.get("user_id") or shift.get("provider_id") or name
             areas[area_key]["current_physicians"].append({
                 "name": name,
                 "shift_start": start_dt.strftime("%H:%M"),

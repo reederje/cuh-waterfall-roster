@@ -225,7 +225,9 @@ def test_build_roster_supertrack_visible_within_first_six_hours():
     assert "Dr. A" in names
 
 
-def test_build_roster_supertrack_hidden_after_first_six_hours():
+def test_build_roster_supertrack_kept_past_six_hours_when_sole_physician():
+    # Removing the only Supertrack physician would leave Supertrack empty,
+    # so they should stay even though they are past the active window.
     shifts = {"scheduled_shifts": [
         _make_shift("ST Pods", start_offset_minutes=-361, end_offset_minutes=60,
                     user_id="1", user_name="Dr. A"),
@@ -233,7 +235,46 @@ def test_build_roster_supertrack_hidden_after_first_six_hours():
     with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
         result = flask_app.build_roster()
 
-    assert result["areas"] == []
+    supertrack_areas = [a for a in result["areas"] if a["name"] == "Supertrack"]
+    assert len(supertrack_areas) == 1
+    names = [p["name"] for p in supertrack_areas[0]["current_physicians"]]
+    assert names == ["Dr. A"]
+
+
+def test_build_roster_supertrack_removed_after_six_hours_once_replacement_arrives():
+    # Dr. A is past the active window, but Dr. B has arrived and is still
+    # within their own window, so Dr. A can safely be dropped.
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-361, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Supertrack Rapid", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    supertrack_areas = [a for a in result["areas"] if a["name"] == "Supertrack"]
+    assert len(supertrack_areas) == 1
+    names = [p["name"] for p in supertrack_areas[0]["current_physicians"]]
+    assert names == ["Dr. B"]
+
+
+def test_build_roster_supertrack_keeps_most_recent_arrival_when_all_overdue():
+    # Both physicians are past the active window; keep the more recent
+    # arrival (Dr. B) rather than leaving Supertrack empty.
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-500, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("Supertrack Rapid", start_offset_minutes=-400, end_offset_minutes=60,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        result = flask_app.build_roster()
+
+    supertrack_areas = [a for a in result["areas"] if a["name"] == "Supertrack"]
+    assert len(supertrack_areas) == 1
+    names = [p["name"] for p in supertrack_areas[0]["current_physicians"]]
+    assert names == ["Dr. B"]
 
 
 def test_build_roster_non_supertrack_not_limited_to_six_hours():
