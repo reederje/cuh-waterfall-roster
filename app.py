@@ -25,6 +25,14 @@ SHIFTADMIN_BASE_URL = "https://www.shiftadmin.com/vutsw"
 ARRIVING_SOON_WINDOW_HOURS = 1
 MAX_SHIFT_HOURS = 12
 SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
+# Smallest amount of time on shift (in hours) used when calculating a
+# physician's patients per hour. Early in a shift, dividing by the real
+# elapsed time would make one patient look like a huge rate, so we divide by
+# at least this much. It used to be a full hour (1.0), which let a physician
+# who just started keep winning patients for their whole first hour and
+# caused long streaks. 0.5 (30 minutes) was the best setting in the
+# July to September sensitivity analysis.
+SUPERTRACK_MIN_ELAPSED_HOURS = 0.5
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
@@ -441,7 +449,7 @@ def _patients_per_hour(patients_assigned, shift_start, now):
     elapsed_hours = (now - shift_start).total_seconds() / 3600
     if elapsed_hours <= 0:
         return 0.0
-    return round(patients_assigned / max(elapsed_hours, 1.0), 1)
+    return round(patients_assigned / max(elapsed_hours, SUPERTRACK_MIN_ELAPSED_HOURS), 1)
 
 
 def _supertrack_phase_multiplier(shift_start, now):

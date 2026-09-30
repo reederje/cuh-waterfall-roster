@@ -538,12 +538,17 @@ def test_assignment_count_rejects_invalid_values():
         flask_app._set_assignment_count("shift", 1.5)
 
 
-def test_patients_per_hour_uses_one_hour_minimum_for_new_shift():
+def test_patients_per_hour_uses_thirty_minute_minimum_for_new_shift():
     shift_start = datetime(2026, 8, 28, 8, 0)
 
-    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=5)) == 1.0
-    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(minutes=30)) == 3.0
+    # Before 30 minutes on shift, divide by 30 minutes (0.5 hours).
+    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=5)) == 2.0
+    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=29)) == 2.0
+    # After 30 minutes, divide by the real time on shift.
+    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(minutes=45)) == 4.0
     assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(hours=2)) == 1.5
+    # No time on shift yet means no rate yet.
+    assert flask_app._patients_per_hour(0, shift_start, shift_start) == 0.0
 
 
 def test_weighted_supertrack_prefers_earlier_shift_phase():
