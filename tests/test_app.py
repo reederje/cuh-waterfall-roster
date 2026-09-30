@@ -674,9 +674,10 @@ def test_record_assignment_logs_supertrack_assignment_and_suggestion():
 
     with flask_app._state_db_conn() as conn:
         rows = conn.execute(
-            "SELECT area_name, assigned_phys_key, suggested_phys_key FROM supertrack_assignment_log"
+            "SELECT area_name, assigned_phys_key, suggested_phys_key, followed_suggestion "
+            "FROM supertrack_assignment_log"
         ).fetchall()
-    assert rows == [("Supertrack", flask_app._physician_key(chosen), suggested_key)]
+    assert rows == [("Supertrack", flask_app._physician_key(chosen), suggested_key, 0)]
 
 
 def test_record_assignment_outside_supertrack_is_not_logged():
@@ -708,6 +709,91 @@ def test_streak_cap_applies_through_the_live_roster():
         after_streak = flask_app.build_roster()["supertrack_state"]["Supertrack"]
 
     assert after_streak != first_pick
+
+
+def test_record_assignment_marks_followed_suggestion():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("ST Pods", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        suggested_key = roster["supertrack_state"]["Supertrack"]
+        physicians = roster["areas"][0]["current_physicians"]
+        chosen = next(p for p in physicians if flask_app._physician_key(p) == suggested_key)
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": chosen["shift_key"]})
+
+    with flask_app._state_db_conn() as conn:
+        flags = conn.execute("SELECT followed_suggestion FROM supertrack_assignment_log").fetchall()
+    assert flags == [(1,)]
+
+
+def test_followed_flag_is_empty_when_there_was_no_suggestion():
+    assert flask_app._followed_flag("A|1|2", None) is None
+    assert flask_app._followed_flag("A|1|2", "A|1|2") == 1
+    assert flask_app._followed_flag("A|1|2", "B|1|2") == 0
+
+
+def _seed_assignment_log():
+    """Today: 3 followed, 1 override, 1 with no suggestion."""
+    for assigned, suggested in [("A", "A"), ("B", "B"), ("A", "A"), ("B", "A"), ("A", None)]:
+        flask_app._log_supertrack_assignment("Supertrack", assigned, suggested)
+
+
+def test_assignment_log_summary_counts_follows_and_overrides(client):
+    _seed_assignment_log()
+    response = client.get("/api/assignment-log/summary", headers=_get_auth_headers())
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["total_assignments"] == 5
+    assert data["followed_suggestion"] == 3
+    assert data["overrode_suggestion"] == 1
+    assert data["no_suggestion"] == 1
+    assert data["override_rate"] == 0.25
+    assert len(data["by_day"]) == 1
+    assert data["by_day"][0]["date"] == datetime.now().date().isoformat()
+
+
+def test_assignment_log_summary_requires_auth(client):
+    assert client.get("/api/assignment-log/summary").status_code == 401
+
+
+def test_assignment_log_summary_rejects_bad_dates(client):
+    headers = _get_auth_headers()
+    assert client.get("/api/assignment-log/summary?start=09-21-2026", headers=headers).status_code == 400
+    assert client.get(
+        "/api/assignment-log/summary?start=2026-09-22&end=2026-09-21", headers=headers
+    ).status_code == 400
+
+
+def test_assignment_log_summary_outside_range_is_empty(client):
+    _seed_assignment_log()
+    response = client.get(
+        "/api/assignment-log/summary?start=2000-01-01&end=2000-01-02", headers=_get_auth_headers()
+    )
+    data = response.get_json()
+    assert data["total_assignments"] == 0
+    assert data["override_rate"] is None
+    assert data["by_day"] == []
+
+
+def test_assignment_log_csv_download(client):
+    _seed_assignment_log()
+    response = client.get("/api/assignment-log.csv", headers=_get_auth_headers())
+    assert response.status_code == 200
+    assert response.mimetype == "text/csv"
+    lines = response.get_data(as_text=True).strip().splitlines()
+    assert lines[0] == "assigned_at,area_name,assigned_physician,suggested_physician,followed_suggestion"
+    assert len(lines) == 6
+    assert lines[4].endswith(",B,A,no")
+    assert lines[5].endswith(",A,,")
+
+
+def test_assignment_log_csv_requires_auth(client):
+    assert client.get("/api/assignment-log.csv").status_code == 401
 
 
 def test_selection_mode_is_persisted_and_broadcast():

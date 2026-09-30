@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 import json
 import logging
 import os
@@ -9,7 +11,7 @@ from functools import wraps
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 
 load_dotenv()
@@ -107,7 +109,8 @@ def _ensure_state_db():
                 assigned_at TEXT NOT NULL,
                 area_name TEXT NOT NULL,
                 assigned_phys_key TEXT NOT NULL,
-                suggested_phys_key TEXT
+                suggested_phys_key TEXT,
+                followed_suggestion INTEGER
             )
             """
         )
@@ -526,6 +529,65 @@ def _strict_round_robin_current(keys, current_key):
     return current_key if current_key in keys else keys[0]
 
 
+def _followed_flag(assigned_phys_key, suggested_phys_key):
+    """1 if pivot assigned the physician the app suggested, 0 if they chose
+    someone else (an override), None if the app had no suggestion."""
+    if not suggested_phys_key:
+        return None
+    return 1 if assigned_phys_key == suggested_phys_key else 0
+
+
+def _parse_log_date_range(args):
+    """Read optional ?start=YYYY-MM-DD&end=YYYY-MM-DD. Both default to today.
+    Raises ValueError on a bad date so the caller can return a 400."""
+    today = datetime.now().date().isoformat()
+    start = args.get("start", today)
+    end = args.get("end", start)
+    for value in (start, end):
+        datetime.strptime(value, "%Y-%m-%d")
+    if end < start:
+        raise ValueError("end must be on or after start")
+    return start, end
+
+
+def _get_assignment_log_rows(start, end):
+    """All Supertrack assignment log rows between two dates (inclusive), oldest first."""
+    with _state_db_conn() as conn:
+        return conn.execute(
+            """
+            SELECT assigned_at, area_name, assigned_phys_key, suggested_phys_key,
+                   followed_suggestion
+            FROM supertrack_assignment_log
+            WHERE substr(assigned_at, 1, 10) BETWEEN ? AND ?
+            ORDER BY id
+            """,
+            (start, end),
+        ).fetchall()
+
+
+def _summarize_assignment_log(rows):
+    """Count how often pivot followed or overrode the app's suggestion, overall and by day."""
+    def counts(subset):
+        followed = sum(1 for row in subset if row[4] == 1)
+        overridden = sum(1 for row in subset if row[4] == 0)
+        with_suggestion = followed + overridden
+        return {
+            "total_assignments": len(subset),
+            "followed_suggestion": followed,
+            "overrode_suggestion": overridden,
+            "no_suggestion": len(subset) - with_suggestion,
+            "override_rate": round(overridden / with_suggestion, 3) if with_suggestion else None,
+        }
+
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row[0][:10], []).append(row)
+    return {
+        **counts(rows),
+        "by_day": [{"date": day, **counts(day_rows)} for day, day_rows in sorted(by_day.items())],
+    }
+
+
 def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key):
     """Record one Supertrack assignment: who got the patient, and who the app
     was suggesting at that moment. The streak cap reads this history, and it
@@ -535,10 +597,17 @@ def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key)
             conn.execute(
                 """
                 INSERT INTO supertrack_assignment_log
-                    (assigned_at, area_name, assigned_phys_key, suggested_phys_key)
-                VALUES (?, ?, ?, ?)
+                    (assigned_at, area_name, assigned_phys_key, suggested_phys_key,
+                     followed_suggestion)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (datetime.now().isoformat(), area_name, assigned_phys_key, suggested_phys_key),
+                (
+                    datetime.now().isoformat(),
+                    area_name,
+                    assigned_phys_key,
+                    suggested_phys_key,
+                    _followed_flag(assigned_phys_key, suggested_phys_key),
+                ),
             )
             conn.commit()
 
@@ -975,6 +1044,42 @@ def index():
 @_require_auth
 def api_roster():
     return jsonify(build_roster())
+
+
+@app.route("/api/assignment-log/summary")
+@_require_auth
+def api_assignment_log_summary():
+    """How often pivot followed vs. overrode the Supertrack suggestion.
+    Optional ?start=YYYY-MM-DD&end=YYYY-MM-DD (defaults to today)."""
+    try:
+        start, end = _parse_log_date_range(request.args)
+    except ValueError:
+        return jsonify({"error": "Use dates in YYYY-MM-DD format, with end on or after start."}), 400
+    return jsonify({"start": start, "end": end,
+                    **_summarize_assignment_log(_get_assignment_log_rows(start, end))})
+
+
+@app.route("/api/assignment-log.csv")
+@_require_auth
+def api_assignment_log_csv():
+    """Every Supertrack assignment in the date range as a CSV download.
+    Optional ?start=YYYY-MM-DD&end=YYYY-MM-DD (defaults to today)."""
+    try:
+        start, end = _parse_log_date_range(request.args)
+    except ValueError:
+        return jsonify({"error": "Use dates in YYYY-MM-DD format, with end on or after start."}), 400
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["assigned_at", "area_name", "assigned_physician", "suggested_physician",
+                     "followed_suggestion"])
+    for row in _get_assignment_log_rows(start, end):
+        writer.writerow([row[0], row[1], row[2], row[3] or "",
+                         {1: "yes", 0: "no"}.get(row[4], "")])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=assignment_log_{start}_to_{end}.csv"},
+    )
 
 
 def _find_active_physician(roster, shift_key):
