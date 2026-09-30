@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 from functools import wraps
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -40,6 +41,9 @@ SUPERTRACK_MIN_ELAPSED_HOURS = 0.5
 # the lowest-scoring *other* physician. If nobody else is available (for
 # example, one physician covering overnight), the cap does not apply.
 SUPERTRACK_MAX_CONSECUTIVE = 4
+# The assignment and skip logs record times in Dallas time, whatever the
+# server clock is set to, so daily summaries line up with CUH's day.
+LOG_TIME_ZONE = ZoneInfo("America/Chicago")
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
@@ -111,6 +115,16 @@ def _ensure_state_db():
                 assigned_phys_key TEXT NOT NULL,
                 suggested_phys_key TEXT,
                 followed_suggestion INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supertrack_skip_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                skipped_at TEXT NOT NULL,
+                area_name TEXT NOT NULL,
+                skipped_phys_key TEXT NOT NULL
             )
             """
         )
@@ -529,6 +543,12 @@ def _strict_round_robin_current(keys, current_key):
     return current_key if current_key in keys else keys[0]
 
 
+def _log_now():
+    """Current Dallas time for the logs, to the millisecond so rapid clicks
+    stay in order, e.g. 2026-10-01T19:05:00.123-05:00."""
+    return datetime.now(LOG_TIME_ZONE).isoformat(timespec="milliseconds")
+
+
 def _followed_flag(assigned_phys_key, suggested_phys_key):
     """1 if pivot assigned the physician the app suggested, 0 if they chose
     someone else (an override), None if the app had no suggestion."""
@@ -540,7 +560,7 @@ def _followed_flag(assigned_phys_key, suggested_phys_key):
 def _parse_log_date_range(args):
     """Read optional ?start=YYYY-MM-DD&end=YYYY-MM-DD. Both default to today.
     Raises ValueError on a bad date so the caller can return a 400."""
-    today = datetime.now().date().isoformat()
+    today = datetime.now(LOG_TIME_ZONE).date().isoformat()
     start = args.get("start", today)
     end = args.get("end", start)
     for value in (start, end):
@@ -565,9 +585,10 @@ def _get_assignment_log_rows(start, end):
         ).fetchall()
 
 
-def _summarize_assignment_log(rows):
-    """Count how often pivot followed or overrode the app's suggestion, overall and by day."""
-    def counts(subset):
+def _summarize_assignment_log(rows, skip_rows=()):
+    """Count how often pivot followed the app's suggestion, assigned someone
+    else instead (override), or pressed Skip, overall and by day."""
+    def counts(subset, skips):
         followed = sum(1 for row in subset if row[4] == 1)
         overridden = sum(1 for row in subset if row[4] == 0)
         with_suggestion = followed + overridden
@@ -577,14 +598,20 @@ def _summarize_assignment_log(rows):
             "overrode_suggestion": overridden,
             "no_suggestion": len(subset) - with_suggestion,
             "override_rate": round(overridden / with_suggestion, 3) if with_suggestion else None,
+            "skips": len(skips),
         }
 
     by_day = {}
     for row in rows:
-        by_day.setdefault(row[0][:10], []).append(row)
+        by_day.setdefault(row[0][:10], ([], []))[0].append(row)
+    for row in skip_rows:
+        by_day.setdefault(row[0][:10], ([], []))[1].append(row)
     return {
-        **counts(rows),
-        "by_day": [{"date": day, **counts(day_rows)} for day, day_rows in sorted(by_day.items())],
+        **counts(rows, skip_rows),
+        "by_day": [
+            {"date": day, **counts(day_rows, day_skips)}
+            for day, (day_rows, day_skips) in sorted(by_day.items())
+        ],
     }
 
 
@@ -602,7 +629,7 @@ def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    datetime.now().isoformat(),
+                    _log_now(),
                     area_name,
                     assigned_phys_key,
                     suggested_phys_key,
@@ -610,6 +637,35 @@ def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key)
                 ),
             )
             conn.commit()
+
+
+def _log_supertrack_skip(area_name, skipped_phys_key):
+    """Record that pivot pressed Skip on the suggested Supertrack physician.
+    Skips are a separate kind of override and do not affect the streak cap."""
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO supertrack_skip_log (skipped_at, area_name, skipped_phys_key)
+                VALUES (?, ?, ?)
+                """,
+                (_log_now(), area_name, skipped_phys_key),
+            )
+            conn.commit()
+
+
+def _get_skip_log_rows(start, end):
+    """All Supertrack skips between two Dallas dates (inclusive), oldest first."""
+    with _state_db_conn() as conn:
+        return conn.execute(
+            """
+            SELECT skipped_at, area_name, skipped_phys_key
+            FROM supertrack_skip_log
+            WHERE substr(skipped_at, 1, 10) BETWEEN ? AND ?
+            ORDER BY id
+            """,
+            (start, end),
+        ).fetchall()
 
 
 def _get_recent_supertrack_assignments(area_name, limit):
@@ -1055,8 +1111,9 @@ def api_assignment_log_summary():
         start, end = _parse_log_date_range(request.args)
     except ValueError:
         return jsonify({"error": "Use dates in YYYY-MM-DD format, with end on or after start."}), 400
-    return jsonify({"start": start, "end": end,
-                    **_summarize_assignment_log(_get_assignment_log_rows(start, end))})
+    return jsonify({"start": start, "end": end, "time_zone": "America/Chicago",
+                    **_summarize_assignment_log(_get_assignment_log_rows(start, end),
+                                                _get_skip_log_rows(start, end))})
 
 
 @app.route("/api/assignment-log.csv")
@@ -1070,11 +1127,18 @@ def api_assignment_log_csv():
         return jsonify({"error": "Use dates in YYYY-MM-DD format, with end on or after start."}), 400
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["assigned_at", "area_name", "assigned_physician", "suggested_physician",
-                     "followed_suggestion"])
-    for row in _get_assignment_log_rows(start, end):
-        writer.writerow([row[0], row[1], row[2], row[3] or "",
-                         {1: "yes", 0: "no"}.get(row[4], "")])
+    writer.writerow(["time_dallas", "area_name", "result", "assigned_physician",
+                     "suggested_physician"])
+    events = [
+        (row[0], row[1], {1: "followed", 0: "overrode"}.get(row[4], "no suggestion"),
+         row[2], row[3] or "")
+        for row in _get_assignment_log_rows(start, end)
+    ] + [
+        (row[0], row[1], "skipped", "", row[2])
+        for row in _get_skip_log_rows(start, end)
+    ]
+    for event in sorted(events, key=lambda event: event[0]):
+        writer.writerow(event)
     return Response(
         buffer.getvalue(),
         mimetype="text/csv",
@@ -1180,6 +1244,8 @@ def handle_skip_next_up(payload=None):
         return
 
     _add_skipped_key(datetime.now().date().isoformat(), skip_key)
+    if next_up.get("type") == "physician":
+        _log_supertrack_skip(next_up.get("area_name", "Supertrack"), skip_key)
     _emit_roster_update()
 
 

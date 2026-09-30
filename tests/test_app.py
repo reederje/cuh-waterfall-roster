@@ -754,7 +754,7 @@ def test_assignment_log_summary_counts_follows_and_overrides(client):
     assert data["no_suggestion"] == 1
     assert data["override_rate"] == 0.25
     assert len(data["by_day"]) == 1
-    assert data["by_day"][0]["date"] == datetime.now().date().isoformat()
+    assert data["by_day"][0]["date"] == datetime.now(flask_app.LOG_TIME_ZONE).date().isoformat()
 
 
 def test_assignment_log_summary_requires_auth(client):
@@ -786,10 +786,66 @@ def test_assignment_log_csv_download(client):
     assert response.status_code == 200
     assert response.mimetype == "text/csv"
     lines = response.get_data(as_text=True).strip().splitlines()
-    assert lines[0] == "assigned_at,area_name,assigned_physician,suggested_physician,followed_suggestion"
+    assert lines[0] == "time_dallas,area_name,result,assigned_physician,suggested_physician"
     assert len(lines) == 6
-    assert lines[4].endswith(",B,A,no")
-    assert lines[5].endswith(",A,,")
+    assert lines[1].endswith(",Supertrack,followed,A,A")
+    assert lines[4].endswith(",Supertrack,overrode,B,A")
+    assert lines[5].endswith(",Supertrack,no suggestion,A,")
+
+
+def test_log_times_are_dallas_time():
+    flask_app._log_supertrack_assignment("Supertrack", "A", "A")
+    with flask_app._state_db_conn() as conn:
+        (logged_at,) = conn.execute("SELECT assigned_at FROM supertrack_assignment_log").fetchone()
+    parsed = datetime.fromisoformat(logged_at)
+    assert parsed.utcoffset() in (timedelta(hours=-5), timedelta(hours=-6))
+    assert abs((parsed - datetime.now(flask_app.LOG_TIME_ZONE)).total_seconds()) < 5
+
+
+def test_skip_on_supertrack_physician_is_logged():
+    shifts = _pod_roster_shifts(num_supertrack=3, num_gray=0, num_purple=0)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        skipped = flask_app.build_roster()["next_up"]["phys_key"]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+
+    today = datetime.now(flask_app.LOG_TIME_ZONE).date().isoformat()
+    rows = flask_app._get_skip_log_rows(today, today)
+    assert [(row[1], row[2]) for row in rows] == [("Supertrack", skipped)]
+
+
+def test_skip_on_pod_is_not_logged():
+    shifts = _pod_roster_shifts(num_supertrack=0, num_gray=1, num_purple=0)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        assert flask_app.build_roster()["next_up"]["type"] == "area"
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+
+    today = datetime.now(flask_app.LOG_TIME_ZONE).date().isoformat()
+    assert flask_app._get_skip_log_rows(today, today) == []
+
+
+def test_skips_do_not_count_toward_streak_cap():
+    for _ in range(flask_app.SUPERTRACK_MAX_CONSECUTIVE):
+        flask_app._log_supertrack_skip("Supertrack", "A")
+    assert flask_app._get_recent_supertrack_assignments("Supertrack", 5) == []
+
+
+def test_summary_and_csv_include_skips(client):
+    _seed_assignment_log()
+    flask_app._log_supertrack_skip("Supertrack", "B")
+    flask_app._log_supertrack_skip("Supertrack", "A")
+
+    data = client.get("/api/assignment-log/summary", headers=_get_auth_headers()).get_json()
+    assert data["skips"] == 2
+    assert data["overrode_suggestion"] == 1
+    assert data["by_day"][0]["skips"] == 2
+    assert data["time_zone"] == "America/Chicago"
+
+    lines = client.get("/api/assignment-log.csv", headers=_get_auth_headers()).get_data(as_text=True).strip().splitlines()
+    assert len(lines) == 8
+    assert lines[-2].endswith(",Supertrack,skipped,,B")
+    assert lines[-1].endswith(",Supertrack,skipped,,A")
 
 
 def test_assignment_log_csv_requires_auth(client):
