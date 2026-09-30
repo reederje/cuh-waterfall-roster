@@ -597,6 +597,7 @@ def _summarize_assignment_log(rows, skip_rows=()):
             "followed_suggestion": followed,
             "overrode_suggestion": overridden,
             "no_suggestion": len(subset) - with_suggestion,
+            "follow_rate": round(followed / with_suggestion, 3) if with_suggestion else None,
             "override_rate": round(overridden / with_suggestion, 3) if with_suggestion else None,
             "skips": len(skips),
         }
@@ -613,6 +614,34 @@ def _summarize_assignment_log(rows, skip_rows=()):
             for day, (day_rows, day_skips) in sorted(by_day.items())
         ],
     }
+
+
+def _display_phys_key(phys_key):
+    """Turn 'Dr. A|13:00|22:00' into 'Dr. A (13:00 to 22:00)' for the review page."""
+    if not phys_key:
+        return ""
+    parts = phys_key.split("|")
+    if len(parts) == 3 and parts[1] and parts[2]:
+        return f"{parts[0]} ({parts[1]} to {parts[2]})"
+    return parts[0]
+
+
+def _assignment_log_events(rows, skip_rows):
+    """Every assignment and skip as one time-ordered list for the CSV and review page."""
+    events = [
+        {
+            "time": row[0],
+            "area_name": row[1],
+            "result": {1: "followed", 0: "overrode"}.get(row[4], "no suggestion"),
+            "assigned": row[2],
+            "suggested": row[3] or "",
+        }
+        for row in rows
+    ] + [
+        {"time": row[0], "area_name": row[1], "result": "skipped", "assigned": "", "suggested": row[2]}
+        for row in skip_rows
+    ]
+    return sorted(events, key=lambda event: event["time"])
 
 
 def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key):
@@ -1129,16 +1158,12 @@ def api_assignment_log_csv():
     writer = csv.writer(buffer)
     writer.writerow(["time_dallas", "area_name", "result", "assigned_physician",
                      "suggested_physician"])
-    events = [
-        (row[0], row[1], {1: "followed", 0: "overrode"}.get(row[4], "no suggestion"),
-         row[2], row[3] or "")
-        for row in _get_assignment_log_rows(start, end)
-    ] + [
-        (row[0], row[1], "skipped", "", row[2])
-        for row in _get_skip_log_rows(start, end)
-    ]
-    for event in sorted(events, key=lambda event: event[0]):
-        writer.writerow(event)
+    events = _assignment_log_events(
+        _get_assignment_log_rows(start, end), _get_skip_log_rows(start, end)
+    )
+    for event in events:
+        writer.writerow([event["time"], event["area_name"], event["result"],
+                         event["assigned"], event["suggested"]])
     return Response(
         buffer.getvalue(),
         mimetype="text/csv",
@@ -1162,6 +1187,37 @@ def _emit_roster_update():
         })
         return
     socketio.emit("roster_updated", roster)
+
+
+@app.route("/assignment-log")
+@_require_auth
+def assignment_log_page():
+    """Readable review page for the Supertrack assignment and skip logs."""
+    error = None
+    try:
+        start, end = _parse_log_date_range(request.args)
+    except ValueError:
+        error = "Use dates in YYYY-MM-DD format, with the end date on or after the start date."
+        start = end = datetime.now(LOG_TIME_ZONE).date().isoformat()
+    rows = _get_assignment_log_rows(start, end)
+    skip_rows = _get_skip_log_rows(start, end)
+    events = [
+        {**event,
+         "time_display": event["time"][:10] + " " + event["time"][11:19],
+         "assigned_display": _display_phys_key(event["assigned"]),
+         "suggested_display": _display_phys_key(event["suggested"])}
+        for event in _assignment_log_events(rows, skip_rows)
+        if event["result"] in ("overrode", "skipped")
+    ]
+    html = render_template(
+        "assignment_log.html",
+        start=start,
+        end=end,
+        error=error,
+        summary=_summarize_assignment_log(rows, skip_rows),
+        exceptions=events,
+    )
+    return html, (400 if error else 200)
 
 
 @socketio.on("set_selection_mode")

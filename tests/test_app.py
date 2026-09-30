@@ -848,6 +848,48 @@ def test_summary_and_csv_include_skips(client):
     assert lines[-1].endswith(",Supertrack,skipped,,A")
 
 
+def test_display_phys_key_is_readable():
+    assert flask_app._display_phys_key("Dr. A|13:00|22:00") == "Dr. A (13:00 to 22:00)"
+    assert flask_app._display_phys_key("Dr. A") == "Dr. A"
+    assert flask_app._display_phys_key(None) == ""
+
+
+def test_assignment_log_page_requires_auth(client):
+    assert client.get("/assignment-log").status_code == 401
+
+
+def test_assignment_log_page_shows_summary_and_exceptions(client):
+    flask_app._log_supertrack_assignment("Supertrack", "Dr. A|13:00|22:00", "Dr. A|13:00|22:00")
+    flask_app._log_supertrack_assignment("Supertrack", "Dr. A|13:00|22:00", "Dr. A|13:00|22:00")
+    flask_app._log_supertrack_assignment("Supertrack", "Dr. A|13:00|22:00", "Dr. A|13:00|22:00")
+    flask_app._log_supertrack_assignment("Supertrack", "Dr. B|11:00|20:00", "Dr. A|13:00|22:00")
+    flask_app._log_supertrack_skip("Supertrack", "Dr. B|11:00|20:00")
+
+    response = client.get("/assignment-log", headers=_get_auth_headers())
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    assert "Supertrack Assignment Log" in page
+    assert "75%" in page          # followed 3 of 4
+    assert "25%" in page          # overrode 1 of 4
+    assert "Assigned someone else" in page
+    assert "Skipped" in page
+    assert "Dr. B (11:00 to 20:00)" in page
+    assert "/api/assignment-log.csv?start=" in page
+
+
+def test_assignment_log_page_rejects_bad_dates(client):
+    response = client.get("/assignment-log?start=not-a-date", headers=_get_auth_headers())
+    assert response.status_code == 400
+    assert "YYYY-MM-DD" in response.get_data(as_text=True)
+
+
+def test_assignment_log_page_escapes_physician_names(client):
+    flask_app._log_supertrack_assignment("Supertrack", "<script>alert(1)</script>|1|2", "Dr. A|1|2")
+    page = client.get("/assignment-log", headers=_get_auth_headers()).get_data(as_text=True)
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;" in page
+
+
 def test_assignment_log_csv_requires_auth(client):
     assert client.get("/api/assignment-log.csv").status_code == 401
 

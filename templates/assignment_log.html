@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Supertrack Assignment Log</title>
+  <style>
+    /* Matches the roster page. No scripts or outside resources on purpose. */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+    }
+    header {
+      background: #161b22;
+      border-bottom: 2px solid #21262d;
+      padding: 1rem 1.5rem;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 600; }
+    header p { color: #8b949e; font-size: 0.85rem; margin-top: 0.25rem; }
+    main { max-width: 1100px; margin: 0 auto; padding: 1.25rem 1.5rem 3rem; }
+
+    form.range {
+      display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.75rem;
+      margin-bottom: 1.25rem;
+    }
+    form.range label { font-size: 0.8rem; color: #8b949e; display: flex; flex-direction: column; gap: 0.25rem; }
+    form.range input {
+      background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.9rem;
+    }
+    .btn {
+      display: inline-block; border: none; border-radius: 6px; padding: 0.5rem 1rem;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer; text-decoration: none; color: #fff;
+    }
+    .btn-go { background: #238636; }
+    .btn-go:hover { background: #2ea043; }
+    .btn-csv { background: #58a6ff; color: #0d1117; }
+    .btn-csv:hover { background: #79c0ff; }
+
+    .error {
+      background: #3d1f1f; border: 1px solid #f85149; color: #ffa198;
+      border-radius: 6px; padding: 0.6rem 0.8rem; margin-bottom: 1rem; font-size: 0.9rem;
+    }
+
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin-bottom: 1.5rem; }
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 0.9rem 1rem; }
+    .card .label { font-size: 0.78rem; color: #8b949e; }
+    .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 0.2rem; }
+    .card .sub { font-size: 0.8rem; color: #8b949e; margin-top: 0.15rem; }
+    .card.follow .value { color: #3fb950; }
+    .card.override .value { color: #d29922; }
+    .card.skip .value { color: #a371f7; }
+
+    h2 { font-size: 1rem; font-weight: 600; margin: 1.5rem 0 0.6rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid #21262d; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #21262d; white-space: nowrap; }
+    th { background: #161b22; color: #8b949e; font-weight: 600; font-size: 0.78rem; }
+    td.num, th.num { text-align: right; }
+    tr:last-child td { border-bottom: none; }
+    .tag { display: inline-block; border-radius: 10px; padding: 0.1rem 0.55rem; font-size: 0.75rem; font-weight: 600; }
+    .tag.overrode { background: #2d2008; color: #d29922; }
+    .tag.skipped { background: #231a3a; color: #a371f7; }
+    .empty { color: #8b949e; padding: 1rem; font-size: 0.9rem; }
+    .note { color: #8b949e; font-size: 0.8rem; margin-top: 1.5rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Supertrack Assignment Log</h1>
+    <p>How often pivot followed the app's suggestion, assigned someone else, or pressed Skip. Dallas time.</p>
+  </header>
+  <main>
+    <form class="range" method="get" action="">
+      <label>Start date <input type="date" name="start" value="{{ start }}" /></label>
+      <label>End date <input type="date" name="end" value="{{ end }}" /></label>
+      <button class="btn btn-go" type="submit">Show</button>
+      <a class="btn btn-csv" href="/api/assignment-log.csv?start={{ start }}&amp;end={{ end }}">Download CSV</a>
+    </form>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    {% macro pct(value) -%}{{ '%.0f' % (value * 100) ~ '%' if value is not none else 'n/a' }}{%- endmacro %}
+
+    <div class="cards">
+      <div class="card">
+        <div class="label">Supertrack assignments</div>
+        <div class="value">{{ summary.total_assignments }}</div>
+        <div class="sub">{{ start }}{% if end != start %} to {{ end }}{% endif %}</div>
+      </div>
+      <div class="card follow">
+        <div class="label">Followed suggestion</div>
+        <div class="value">{{ pct(summary.follow_rate) }}</div>
+        <div class="sub">{{ summary.followed_suggestion }} assignments</div>
+      </div>
+      <div class="card override">
+        <div class="label">Assigned someone else</div>
+        <div class="value">{{ pct(summary.override_rate) }}</div>
+        <div class="sub">{{ summary.overrode_suggestion }} overrides</div>
+      </div>
+      <div class="card skip">
+        <div class="label">Skips</div>
+        <div class="value">{{ summary.skips }}</div>
+        <div class="sub">pressed Skip on the suggested doc</div>
+      </div>
+    </div>
+
+    <h2>By day</h2>
+    <div class="table-wrap">
+      {% if summary.by_day %}
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th><th class="num">Assignments</th><th class="num">Followed</th>
+            <th class="num">Overrides</th><th class="num">Override rate</th><th class="num">Skips</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for day in summary.by_day %}
+          <tr>
+            <td>{{ day.date }}</td>
+            <td class="num">{{ day.total_assignments }}</td>
+            <td class="num">{{ day.followed_suggestion }}</td>
+            <td class="num">{{ day.overrode_suggestion }}</td>
+            <td class="num">{{ pct(day.override_rate) }}</td>
+            <td class="num">{{ day.skips }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty">No Supertrack assignments or skips logged for these dates.</p>
+      {% endif %}
+    </div>
+
+    <h2>Every override and skip</h2>
+    <div class="table-wrap">
+      {% if exceptions %}
+      <table>
+        <thead>
+          <tr><th>Time</th><th>What happened</th><th>App suggested</th><th>Patient went to</th></tr>
+        </thead>
+        <tbody>
+          {% for event in exceptions %}
+          <tr>
+            <td>{{ event.time_display }}</td>
+            <td><span class="tag {{ event.result }}">{{ 'Assigned someone else' if event.result == 'overrode' else 'Skipped' }}</span></td>
+            <td>{{ event.suggested_display }}</td>
+            <td>{{ event.assigned_display if event.assigned_display else '(skip, no assignment)' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty">No overrides or skips for these dates.</p>
+      {% endif %}
+    </div>
+
+    <p class="note">
+      An override is a Supertrack assignment to someone other than the physician shown as next up.
+      Skips on Gray/Purple pods are not included. Rates leave out assignments made when the app had
+      no suggestion. The log stores no patient information.
+    </p>
+  </main>
+</body>
+</html>
