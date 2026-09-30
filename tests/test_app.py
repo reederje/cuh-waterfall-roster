@@ -592,6 +592,124 @@ def test_strict_round_robin_ignores_phase_scores():
     ) == "B|08:00|16:00"
 
 
+def _two_supertrack_physicians(now):
+    """A is the lowest score (fewest patients per hour), so A would normally win."""
+    return [
+        {
+            "name": "A", "shift_start": "13:00", "shift_end": "22:00",
+            "patients_per_hour": 1.0, "_shift_start": now - timedelta(hours=1),
+        },
+        {
+            "name": "B", "shift_start": "11:00", "shift_end": "20:00",
+            "patients_per_hour": 3.0, "_shift_start": now - timedelta(hours=3),
+        },
+    ]
+
+
+def test_streak_cap_skips_physician_after_max_consecutive():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _two_supertrack_physicians(now)
+    a_key = "A|13:00|22:00"
+    recent = [a_key] * flask_app.SUPERTRACK_MAX_CONSECUTIVE
+
+    assert flask_app._weighted_supertrack_next(physicians, a_key, now, None, recent) == "B|11:00|20:00"
+
+
+def test_streak_cap_allows_lowest_score_below_max_consecutive():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _two_supertrack_physicians(now)
+    a_key = "A|13:00|22:00"
+    recent = [a_key] * (flask_app.SUPERTRACK_MAX_CONSECUTIVE - 1)
+
+    assert flask_app._weighted_supertrack_next(physicians, a_key, now, None, recent) == a_key
+
+
+def test_streak_cap_ignores_history_that_is_not_all_one_physician():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _two_supertrack_physicians(now)
+    a_key = "A|13:00|22:00"
+    recent = ["B|11:00|20:00"] + [a_key] * (flask_app.SUPERTRACK_MAX_CONSECUTIVE - 1)
+
+    assert flask_app._weighted_supertrack_next(physicians, a_key, now, None, recent) == a_key
+
+
+def test_streak_cap_does_not_apply_when_only_one_physician_is_available():
+    now = datetime(2026, 8, 28, 2, 0)
+    physicians = [{
+        "name": "Solo", "shift_start": "23:00", "shift_end": "08:00",
+        "patients_per_hour": 2.0, "_shift_start": now - timedelta(hours=3),
+    }]
+    solo_key = "Solo|23:00|08:00"
+    recent = [solo_key] * (flask_app.SUPERTRACK_MAX_CONSECUTIVE + 2)
+
+    assert flask_app._weighted_supertrack_next(physicians, solo_key, now, None, recent) == solo_key
+
+
+def test_streak_cap_does_not_change_strict_round_robin():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _two_supertrack_physicians(now)
+    a_key = "A|13:00|22:00"
+    recent = [a_key] * flask_app.SUPERTRACK_MAX_CONSECUTIVE
+
+    assert flask_app._weighted_supertrack_next(
+        physicians, a_key, now, "strict_round_robin", recent
+    ) == a_key
+
+
+def test_record_assignment_logs_supertrack_assignment_and_suggestion():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-30, end_offset_minutes=30,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("ST Pods", start_offset_minutes=-20, end_offset_minutes=40,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        suggested_key = roster["supertrack_state"]["Supertrack"]
+        physicians = roster["areas"][0]["current_physicians"]
+        # Pivot picks the physician the app did NOT suggest (an override).
+        chosen = next(p for p in physicians if flask_app._physician_key(p) != suggested_key)
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": chosen["shift_key"]})
+
+    with flask_app._state_db_conn() as conn:
+        rows = conn.execute(
+            "SELECT area_name, assigned_phys_key, suggested_phys_key FROM supertrack_assignment_log"
+        ).fetchall()
+    assert rows == [("Supertrack", flask_app._physician_key(chosen), suggested_key)]
+
+
+def test_record_assignment_outside_supertrack_is_not_logged():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        physician = roster["areas"][0]["current_physicians"][0]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("record_assignment", {"shift_key": physician["shift_key"]})
+
+    assert flask_app._get_recent_supertrack_assignments("ED Main", 5) == []
+
+
+def test_streak_cap_applies_through_the_live_roster():
+    """Three logged assignments in a row to one physician move next up to the other."""
+    shifts = {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-30, end_offset_minutes=300,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("ST Pods", start_offset_minutes=-200, end_offset_minutes=300,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        first_pick = roster["supertrack_state"]["Supertrack"]
+        for _ in range(flask_app.SUPERTRACK_MAX_CONSECUTIVE):
+            flask_app._log_supertrack_assignment("Supertrack", first_pick, first_pick)
+        after_streak = flask_app.build_roster()["supertrack_state"]["Supertrack"]
+
+    assert after_streak != first_pick
+
+
 def test_selection_mode_is_persisted_and_broadcast():
     flask_app._set_selection_mode("strict_round_robin")
     assert flask_app._get_selection_mode() == "strict_round_robin"

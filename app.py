@@ -33,6 +33,11 @@ SUPERTRACK_ACTIVE_WINDOW_HOURS = 6
 # caused long streaks. 0.5 (30 minutes) was the best setting in the
 # July to September sensitivity analysis.
 SUPERTRACK_MIN_ELAPSED_HOURS = 0.5
+# Most Supertrack patients in a row one physician can receive while another
+# physician is available. After this many in a row, the next patient goes to
+# the lowest-scoring *other* physician. If nobody else is available (for
+# example, one physician covering overnight), the cap does not apply.
+SUPERTRACK_MAX_CONSECUTIVE = 4
 TARGET_FACILITY_ID = 10
 COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
@@ -92,6 +97,17 @@ def _ensure_state_db():
                 setting_key TEXT PRIMARY KEY,
                 setting_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supertrack_assignment_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assigned_at TEXT NOT NULL,
+                area_name TEXT NOT NULL,
+                assigned_phys_key TEXT NOT NULL,
+                suggested_phys_key TEXT
             )
             """
         )
@@ -510,7 +526,56 @@ def _strict_round_robin_current(keys, current_key):
     return current_key if current_key in keys else keys[0]
 
 
-def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None):
+def _log_supertrack_assignment(area_name, assigned_phys_key, suggested_phys_key):
+    """Record one Supertrack assignment: who got the patient, and who the app
+    was suggesting at that moment. The streak cap reads this history, and it
+    also shows when pivots chose someone other than the suggestion."""
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO supertrack_assignment_log
+                    (assigned_at, area_name, assigned_phys_key, suggested_phys_key)
+                VALUES (?, ?, ?, ?)
+                """,
+                (datetime.now().isoformat(), area_name, assigned_phys_key, suggested_phys_key),
+            )
+            conn.commit()
+
+
+def _get_recent_supertrack_assignments(area_name, limit):
+    """Return the most recent assigned physician keys for an area, oldest first."""
+    try:
+        with _state_db_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT assigned_phys_key
+                FROM supertrack_assignment_log
+                WHERE area_name = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (area_name, limit),
+            ).fetchall()
+        return [row[0] for row in reversed(rows)]
+    except Exception as exc:
+        logger.warning("State DB read failed for assignment log: %s", exc)
+        return []
+
+
+def _streak_capped_key(recent_keys, keys):
+    """Return the physician who has received SUPERTRACK_MAX_CONSECUTIVE
+    patients in a row, if someone else is available to take the next one.
+    Otherwise return None (no one is capped)."""
+    if len(keys) < 2 or len(recent_keys) < SUPERTRACK_MAX_CONSECUTIVE:
+        return None
+    last_keys = recent_keys[-SUPERTRACK_MAX_CONSECUTIVE:]
+    if len(set(last_keys)) == 1 and last_keys[0] in keys:
+        return last_keys[0]
+    return None
+
+
+def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None, recent_keys=None):
     if not physicians:
         return None
 
@@ -518,12 +583,16 @@ def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None)
     if selection_mode == "strict_round_robin":
         return _strict_round_robin_current(keys, current_key)
 
+    # Streak cap: leave out a physician who just received too many in a row.
+    capped_key = _streak_capped_key(recent_keys or [], keys)
+
     scores = {
         _physician_key(physician): (
             physician["patients_per_hour"]
             * _supertrack_phase_multiplier(physician["_shift_start"], now)
         )
         for physician in physicians
+        if _physician_key(physician) != capped_key
     }
     lowest_score = min(scores.values())
     tied_keys = {
@@ -704,8 +773,9 @@ def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
         ] or all_physicians
 
         current_key = _get_supertrack_indicator_key(date_key, area_name)
+        recent_keys = _get_recent_supertrack_assignments(area_name, SUPERTRACK_MAX_CONSECUTIVE)
         next_key = _weighted_supertrack_next(
-            eligible_physicians, current_key, now, selection_mode
+            eligible_physicians, current_key, now, selection_mode, recent_keys
         )
         if next_key != current_key:
             _set_supertrack_indicator_key(date_key, area_name, next_key)
@@ -958,6 +1028,12 @@ def handle_record_assignment(payload):
         return
 
     _increment_assignment_count(shift_key)
+    if area and area.get("is_supertrack"):
+        _log_supertrack_assignment(
+            area["name"],
+            _physician_key(physician),
+            roster.get("supertrack_state", {}).get(area["name"]),
+        )
     if area and (area.get("is_supertrack") or area.get("name") in ROTATION_POD_AREAS):
         _advance_rotation_counter(datetime.now().date().isoformat())
     # A real assignment ends the current round, so skipped entities are eligible again.
