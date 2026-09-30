@@ -58,6 +58,44 @@ Notes:
 - The Basic Auth username is fixed in code as `cuhed`.
 - Set `FLASK_DEBUG=1` for local debug mode.
 
+## Supertrack assignment settings
+
+Two settings near the top of `app.py` control how the next Supertrack
+physician is chosen in `phase_multiplier` mode. They are fixed in code on
+purpose; change them only through a reviewed pull request.
+
+- `SUPERTRACK_MIN_ELAPSED_HOURS` (0.5): patients per hour is divided by the
+  real time on shift, but never by less than this many hours. This keeps a
+  physician who just started from winning every patient in their first hour.
+- `SUPERTRACK_MAX_CONSECUTIVE` (4): the most Supertrack patients in a row one
+  physician can receive while another physician is available.
+
+## Supertrack assignment and skip logs
+
+Every Supertrack assignment is recorded in `supertrack_assignment_log`: the
+time, the physician assigned, the physician the app suggested at that
+moment, and `followed_suggestion` (1 = followed, 0 = pivot assigned someone
+else, empty = no suggestion). Every Skip on a suggested Supertrack physician
+is recorded in `supertrack_skip_log`. Skips on Gray/Purple pods are not
+logged, and skips do not count toward the streak cap. Neither log stores
+patient information.
+
+Times are recorded in Dallas time (America/Chicago) to the millisecond,
+regardless of the server clock.
+
+To review the logs (same login as the roster):
+
+- `/assignment-log`: a readable page with a date picker, summary cards
+  (assignments, follow rate, override rate, skips), a by-day table, and
+  every override and skip.
+- `/api/assignment-log/summary`: the same numbers as JSON.
+- `/api/assignment-log.csv`: every event with a result of followed,
+  overrode, skipped, or no suggestion.
+
+All three accept optional `?start=YYYY-MM-DD&end=YYYY-MM-DD` (Dallas dates)
+and default to today. Manual count corrections (`set_assignment_count`) are
+not logged.
+
 ## 4. Run the application
 
 ```bash
