@@ -30,6 +30,7 @@ COLOR_AREAS = ("Grey", "Blue", "Purple", "Orange")
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrack_state.db"))
 SUPERTRACK_SELECTION_MODES = ("phase_multiplier", "strict_round_robin")
 DEFAULT_SUPERTRACK_SELECTION_MODE = "phase_multiplier"
+MAX_CONSECUTIVE_ASSIGNMENTS = 4
 # Pod areas (besides Supertrack) that participate in the "next up" rotation
 # as a single unit, rather than per-physician.
 ROTATION_POD_AREAS = ("Gray", "Purple")
@@ -92,6 +93,16 @@ def _ensure_state_db():
             CREATE TABLE IF NOT EXISTS rotation_state (
                 date_key TEXT PRIMARY KEY,
                 counter INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assignment_streak_state (
+                date_key TEXT PRIMARY KEY,
+                last_phys_key TEXT NOT NULL,
+                streak_count INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -441,7 +452,7 @@ def _patients_per_hour(patients_assigned, shift_start, now):
     elapsed_hours = (now - shift_start).total_seconds() / 3600
     if elapsed_hours <= 0:
         return 0.0
-    return round(patients_assigned / max(elapsed_hours, 1.0), 1)
+    return round(patients_assigned / max(elapsed_hours, 0.5), 1)
 
 
 def _supertrack_phase_multiplier(shift_start, now):
@@ -502,13 +513,19 @@ def _strict_round_robin_current(keys, current_key):
     return current_key if current_key in keys else keys[0]
 
 
-def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None):
+def _weighted_supertrack_next(physicians, current_key, now, selection_mode=None,
+                              blocked_key=None):
     if not physicians:
         return None
 
     keys = [_physician_key(physician) for physician in physicians]
     if selection_mode == "strict_round_robin":
         return _strict_round_robin_current(keys, current_key)
+
+    # Never block the only candidate.
+    if blocked_key in keys and len(keys) > 1:
+        physicians = [p for p in physicians if _physician_key(p) != blocked_key]
+        keys = [_physician_key(physician) for physician in physicians]
 
     scores = {
         _physician_key(physician): (
@@ -610,6 +627,40 @@ def _advance_rotation_counter(date_key):
             conn.commit()
 
 
+def _get_assignment_streak(date_key):
+    try:
+        with _state_db_conn() as conn:
+            row = conn.execute(
+                "SELECT last_phys_key, streak_count FROM assignment_streak_state WHERE date_key = ?",
+                (date_key,),
+            ).fetchone()
+        if row:
+            return row[0], row[1]
+    except Exception as exc:
+        logger.warning("State DB read failed for assignment streak: %s", exc)
+    return None, 0
+
+
+def _record_streak_assignment(date_key, phys_key):
+    with _STATE_DB_LOCK:
+        last_key, count = _get_assignment_streak(date_key)
+        count = count + 1 if last_key == phys_key else 1
+        with _state_db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO assignment_streak_state
+                    (date_key, last_phys_key, streak_count, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date_key) DO UPDATE SET
+                    last_phys_key = excluded.last_phys_key,
+                    streak_count = excluded.streak_count,
+                    updated_at = excluded.updated_at
+                """,
+                (date_key, phys_key, count, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+
 def _build_rotation_slots(areas):
     """Build the ordered set of "next up" rotation entries: one slot per
     current Supertrack physician, plus one slot per non-empty pod area
@@ -677,6 +728,8 @@ def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
     Entries recorded in skip_state are excluded from being chosen."""
     supertrack_state = {}
     skipped_keys = _get_skipped_keys(date_key)
+    streak_key, streak_count = _get_assignment_streak(date_key)
+    blocked_key = streak_key if streak_count >= MAX_CONSECUTIVE_ASSIGNMENTS else None
 
     for area in areas:
         if not area.get("is_supertrack"):
@@ -697,7 +750,7 @@ def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
 
         current_key = _get_supertrack_indicator_key(date_key, area_name)
         next_key = _weighted_supertrack_next(
-            eligible_physicians, current_key, now, selection_mode
+            eligible_physicians, current_key, now, selection_mode, blocked_key
         )
         if next_key != current_key:
             _set_supertrack_indicator_key(date_key, area_name, next_key)
@@ -950,6 +1003,7 @@ def handle_record_assignment(payload):
         return
 
     _increment_assignment_count(shift_key)
+    _record_streak_assignment(datetime.now().date().isoformat(), _physician_key(physician))
     if area and (area.get("is_supertrack") or area.get("name") in ROTATION_POD_AREAS):
         _advance_rotation_counter(datetime.now().date().isoformat())
     # A real assignment ends the current round, so skipped entities are eligible again.

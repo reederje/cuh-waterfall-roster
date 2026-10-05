@@ -646,6 +646,104 @@ def test_strict_round_robin_assignment_moves_next_up_marker():
     )
 
 
+def _streak_physicians(now):
+    return [
+        {
+            "name": name, "shift_start": "13:00", "shift_end": "21:00",
+            "patients_per_hour": pph, "_shift_start": now - timedelta(hours=1),
+        }
+        for name, pph in (("A", 0.1), ("B", 0.5), ("C", 0.9))
+    ]
+
+
+def test_weighted_blocked_key_falls_to_second_lowest():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _streak_physicians(now)
+    assert flask_app._weighted_supertrack_next(
+        physicians, None, now, blocked_key="A|13:00|21:00"
+    ) == "B|13:00|21:00"
+
+
+def test_weighted_blocked_key_ignored_for_sole_candidate():
+    now = datetime(2026, 8, 28, 14, 0)
+    physicians = _streak_physicians(now)[:1]
+    assert flask_app._weighted_supertrack_next(
+        physicians, None, now, blocked_key="A|13:00|21:00"
+    ) == "A|13:00|21:00"
+
+
+def test_assignment_streak_increments_and_resets():
+    date_key = "2026-08-28"
+    for _ in range(3):
+        flask_app._record_streak_assignment(date_key, "A")
+    assert flask_app._get_assignment_streak(date_key) == ("A", 3)
+    flask_app._record_streak_assignment(date_key, "B")
+    assert flask_app._get_assignment_streak(date_key) == ("B", 1)
+    assert flask_app._get_assignment_streak("2026-08-29") == (None, 0)
+
+
+def _two_physician_shifts():
+    # A is far behind B in score, so A is the weighted pick until blocked.
+    return {"scheduled_shifts": [
+        _make_shift("ST Pods", start_offset_minutes=-60, end_offset_minutes=60,
+                    user_id="1", user_name="Dr. A"),
+        _make_shift("ST Pods", start_offset_minutes=-60, end_offset_minutes=60,
+                    user_id="2", user_name="Dr. B"),
+    ]}
+
+
+def _supertrack_next(shifts):
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+    return roster["next_up"]["phys_key"], roster["areas"][0]["current_physicians"]
+
+
+def _force_streak(phys_key, count):
+    date_key = datetime.now().date().isoformat()
+    for _ in range(count):
+        flask_app._record_streak_assignment(date_key, phys_key)
+
+
+def test_four_consecutive_assignments_move_next_up_to_second_lowest():
+    shifts = _two_physician_shifts()
+    first_key, physicians = _supertrack_next(shifts)
+    other_key = next(
+        flask_app._physician_key(p) for p in physicians
+        if flask_app._physician_key(p) != first_key
+    )
+
+    _force_streak(first_key, 3)
+    assert _supertrack_next(shifts)[0] == first_key
+    _force_streak(first_key, 1)
+    assert _supertrack_next(shifts)[0] == other_key
+
+
+def test_other_assignment_or_pod_assignment_resets_streak_block():
+    shifts = _two_physician_shifts()
+    first_key, physicians = _supertrack_next(shifts)
+    other_key = next(
+        flask_app._physician_key(p) for p in physicians
+        if flask_app._physician_key(p) != first_key
+    )
+    date_key = datetime.now().date().isoformat()
+
+    _force_streak(first_key, 4)
+    flask_app._record_streak_assignment(date_key, other_key)
+    assert _supertrack_next(shifts)[0] == first_key
+
+
+def test_skip_does_not_count_toward_streak():
+    shifts = _two_physician_shifts()
+    first_key, _ = _supertrack_next(shifts)
+    _force_streak(first_key, 3)
+
+    socket_client = flask_app.socketio.test_client(flask_app.app)
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        socket_client.emit("skip_next_up")
+
+    assert flask_app._get_assignment_streak(datetime.now().date().isoformat()) == (first_key, 3)
+
+
 def test_supertrack_day_simulation():
     """Simulate the supplied average arrivals from 6 AM through 5:59 AM."""
     simulation_start = datetime(2026, 8, 28, 6, 0)
