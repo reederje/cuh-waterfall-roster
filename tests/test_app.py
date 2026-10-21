@@ -16,6 +16,7 @@ import app as flask_app
 def state_db(tmp_path, monkeypatch):
     monkeypatch.setattr(flask_app, "STATE_DB_PATH", str(tmp_path / "state.db"))
     flask_app._ensure_state_db()
+    flask_app._SHIFTS_CACHE.clear()
 
 
 @pytest.fixture
@@ -538,11 +539,11 @@ def test_assignment_count_rejects_invalid_values():
         flask_app._set_assignment_count("shift", 1.5)
 
 
-def test_patients_per_hour_uses_one_hour_minimum_for_new_shift():
+def test_patients_per_hour_uses_half_hour_minimum_for_new_shift():
     shift_start = datetime(2026, 8, 28, 8, 0)
 
-    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=5)) == 1.0
-    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(minutes=30)) == 3.0
+    assert flask_app._patients_per_hour(1, shift_start, shift_start + timedelta(minutes=5)) == 2.0
+    assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(minutes=30)) == 6.0
     assert flask_app._patients_per_hour(3, shift_start, shift_start + timedelta(hours=2)) == 1.5
 
 
@@ -622,6 +623,70 @@ def test_record_assignment_broadcasts_updated_roster():
     assert len(updates) == 1
     updated_physician = updates[0]["args"][0]["areas"][0]["current_physicians"][0]
     assert updated_physician["patients_assigned"] == 1
+
+
+def test_shift_data_is_cached_within_ttl_and_refetched_after():
+    shifts = {"scheduled_shifts": []}
+    with patch.object(flask_app, "_post", return_value=shifts) as post:
+        flask_app.build_roster()
+        flask_app.build_roster()
+        assert post.call_count == 1
+
+        for key, (fetched_at, data) in list(flask_app._SHIFTS_CACHE.items()):
+            flask_app._SHIFTS_CACHE[key] = (
+                fetched_at - timedelta(hours=flask_app.SHIFTADMIN_CACHE_HOURS + 1), data
+            )
+        flask_app.build_roster()
+        assert post.call_count == 2
+
+
+def test_refresh_param_bypasses_shift_cache(client):
+    shifts = {"scheduled_shifts": []}
+    auth = {"Authorization": "Basic " + base64.b64encode(
+        f"{flask_app.AUTH_USERNAME}:{flask_app.AUTH_PASSWORD}".encode()).decode()}
+    with patch.object(flask_app, "_post", return_value=shifts) as post:
+        client.get("/api/roster", headers=auth)
+        client.get("/api/roster", headers=auth)
+        assert post.call_count == 1
+        client.get("/api/roster?refresh=1", headers=auth)
+        assert post.call_count == 2
+
+
+def test_failed_shift_fetch_is_not_cached():
+    with patch.object(flask_app, "_post", return_value=None) as post:
+        flask_app.build_roster()
+        flask_app.build_roster()
+        assert post.call_count == 2
+
+
+def test_assignment_history_keeps_last_three_newest_first():
+    for name in ("Dr. A", "Dr. B", "Dr. C", "Dr. D"):
+        flask_app._record_assignment_history(name, "ED Main")
+
+    history = flask_app._get_assignment_history()
+    assert [h["name"] for h in history] == ["Dr. D", "Dr. C", "Dr. B"]
+    assert all(h["area"] == "ED Main" and h["assigned_at"] for h in history)
+
+
+def test_record_assignment_adds_history_and_set_count_does_not():
+    shifts = {"scheduled_shifts": [
+        _make_shift("ED Main", start_offset_minutes=-30, end_offset_minutes=30)
+    ]}
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        assert roster["assignment_history"] == []
+        shift_key = roster["areas"][0]["current_physicians"][0]["shift_key"]
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("set_assignment_count", {"shift_key": shift_key, "patients_assigned": 3})
+        assert flask_app._get_assignment_history() == []
+        socket_client.emit("record_assignment", {"shift_key": shift_key})
+        received = socket_client.get_received()
+
+    updates = [e for e in received if e["name"] == "roster_updated"]
+    history = updates[-1]["args"][0]["assignment_history"]
+    assert len(history) == 1
+    assert history[0]["name"] == "Dr. Smith"
+    assert history[0]["area"] == "ED Main"
 
 
 def test_strict_round_robin_assignment_moves_next_up_marker():
@@ -977,6 +1042,31 @@ def test_skip_next_up_on_pod_moves_to_next_area():
 
     updates = [event for event in received if event["name"] == "roster_updated"]
     assert updates[0]["args"][0]["next_up"] == {"type": "area", "area_name": "Purple"}
+
+
+def test_skipping_both_pods_then_assigning_does_not_repeat_purple():
+    shifts = _pod_roster_shifts(num_supertrack=3, num_gray=1, num_purple=1)
+    date_key = datetime.now().date().isoformat()
+    flask_app._advance_rotation_counter(date_key, 3)  # three ST assignments done
+
+    with patch.object(flask_app, "_post", side_effect=_mock_post_factory(None, shifts)):
+        roster = flask_app.build_roster()
+        assert roster["next_up"] == {"type": "area", "area_name": "Gray"}
+
+        socket_client = flask_app.socketio.test_client(flask_app.app)
+        socket_client.emit("skip_next_up")
+        socket_client.emit("skip_next_up")
+        received = socket_client.get_received()
+        updates = [e for e in received if e["name"] == "roster_updated"]
+        assert updates[-1]["args"][0]["next_up"]["type"] == "physician"
+
+        st_area = next(a for a in roster["areas"] if a["is_supertrack"])
+        shift_key = st_area["current_physicians"][0]["shift_key"]
+        socket_client.emit("record_assignment", {"shift_key": shift_key})
+        received = socket_client.get_received()
+
+    updates = [e for e in received if e["name"] == "roster_updated"]
+    assert updates[-1]["args"][0]["next_up"]["type"] == "physician"
 
 
 def test_real_assignment_clears_skip_state():

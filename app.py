@@ -31,6 +31,10 @@ STATE_DB_PATH = os.environ.get("STATE_DB_PATH", os.path.join("state", "supertrac
 SUPERTRACK_SELECTION_MODES = ("phase_multiplier", "strict_round_robin")
 DEFAULT_SUPERTRACK_SELECTION_MODE = "phase_multiplier"
 MAX_CONSECUTIVE_ASSIGNMENTS = 4
+ASSIGNMENT_HISTORY_LIMIT = 3
+# How long fetched ShiftAdmin shift data is reused before calling the API again.
+SHIFTADMIN_CACHE_HOURS = 6
+ASSIGNMENT_HISTORY_RETAIN = 50
 # Pod areas (besides Supertrack) that participate in the "next up" rotation
 # as a single unit, rather than per-physician.
 ROTATION_POD_AREAS = ("Gray", "Purple")
@@ -43,6 +47,8 @@ LAST_SHIFTADMIN_ERROR = None
 AUTH_USERNAME = "cuhed"
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
 _STATE_DB_LOCK = threading.Lock()
+_SHIFTS_CACHE = {}
+_SHIFTS_CACHE_LOCK = threading.Lock()
 
 socketio = SocketIO(
     app,
@@ -104,6 +110,16 @@ def _ensure_state_db():
                 last_phys_key TEXT NOT NULL,
                 streak_count INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assignment_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phys_name TEXT NOT NULL,
+                area_name TEXT NOT NULL,
+                assigned_at TEXT NOT NULL
             )
             """
         )
@@ -448,6 +464,38 @@ def _set_assignment_count(shift_key, patients_assigned):
             conn.commit()
 
 
+def _record_assignment_history(phys_name, area_name):
+    with _STATE_DB_LOCK:
+        with _state_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO assignment_history (phys_name, area_name, assigned_at) VALUES (?, ?, ?)",
+                (phys_name, area_name, datetime.now().isoformat()),
+            )
+            conn.execute(
+                "DELETE FROM assignment_history WHERE id NOT IN "
+                "(SELECT id FROM assignment_history ORDER BY id DESC LIMIT ?)",
+                (ASSIGNMENT_HISTORY_RETAIN,),
+            )
+            conn.commit()
+
+
+def _get_assignment_history(limit=ASSIGNMENT_HISTORY_LIMIT):
+    try:
+        with _state_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT phys_name, area_name, assigned_at FROM assignment_history "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {"name": name, "area": area, "assigned_at": assigned_at}
+            for name, area, assigned_at in rows
+        ]
+    except Exception as exc:
+        logger.error("Failed to read assignment history: %s", exc)
+        return []
+
+
 def _patients_per_hour(patients_assigned, shift_start, now):
     elapsed_hours = (now - shift_start).total_seconds() / 3600
     if elapsed_hours <= 0:
@@ -611,18 +659,18 @@ def _get_rotation_counter(date_key):
         return 0
 
 
-def _advance_rotation_counter(date_key):
+def _advance_rotation_counter(date_key, steps=1):
     with _STATE_DB_LOCK:
         with _state_db_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO rotation_state (date_key, counter, updated_at)
-                VALUES (?, 1, ?)
+                VALUES (?, ?, ?)
                 ON CONFLICT(date_key) DO UPDATE SET
-                    counter = counter + 1,
+                    counter = counter + excluded.counter,
                     updated_at = excluded.updated_at
                 """,
-                (date_key, datetime.now().isoformat()),
+                (date_key, steps, datetime.now().isoformat()),
             )
             conn.commit()
 
@@ -681,6 +729,16 @@ def _build_rotation_slots(areas):
     slots.extend(area["name"] for area in pod_areas)
 
     return slots
+
+
+def _pick_rotation_slot(slots, counter, skipped_keys):
+    """Return (slot, offset past counter) for the next recommended slot."""
+    num_slots = len(slots)
+    for offset in range(num_slots):
+        candidate = slots[(counter + offset) % num_slots]
+        if candidate == "supertrack" or candidate not in skipped_keys:
+            return candidate, offset
+    return slots[counter % num_slots], 0
 
 
 def _get_skipped_keys(date_key):
@@ -761,16 +819,7 @@ def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
     if not slots:
         return supertrack_state, None
 
-    counter = _get_rotation_counter(date_key)
-    num_slots = len(slots)
-    chosen = None
-    for offset in range(num_slots):
-        candidate = slots[(counter + offset) % num_slots]
-        if candidate == "supertrack" or candidate not in skipped_keys:
-            chosen = candidate
-            break
-    if chosen is None:
-        chosen = slots[counter % num_slots]
+    chosen, _ = _pick_rotation_slot(slots, _get_rotation_counter(date_key), skipped_keys)
 
     if chosen == "supertrack":
         supertrack_area = next((area for area in areas if area.get("is_supertrack")), None)
@@ -786,7 +835,27 @@ def _hydrate_supertrack_state(areas, date_key, now, selection_mode):
     return supertrack_state, next_up
 
 
-def build_roster():
+def _fetch_shifts_cached(start_date, end_date, force_refresh=False):
+    """Return ShiftAdmin shift data, reusing it for SHIFTADMIN_CACHE_HOURS. Failures are not cached."""
+    cache_key = (start_date, end_date)
+    now = datetime.now()
+    with _SHIFTS_CACHE_LOCK:
+        entry = _SHIFTS_CACHE.get(cache_key)
+        if not force_refresh and entry and now - entry[0] < timedelta(hours=SHIFTADMIN_CACHE_HOURS):
+            return entry[1]
+
+    data = _post(
+        "org_scheduled_shifts",
+        {"type": "json", "start_date": start_date, "end_date": end_date},
+    )
+    if data is not None:
+        with _SHIFTS_CACHE_LOCK:
+            _SHIFTS_CACHE.clear()
+            _SHIFTS_CACHE[cache_key] = (now, data)
+    return data
+
+
+def build_roster(force_refresh=False):
     now = datetime.now()
     query_start_dt = now - timedelta(hours=MAX_SHIFT_HOURS)
     query_end_dt = now + timedelta(hours=ARRIVING_SOON_WINDOW_HOURS)
@@ -795,10 +864,7 @@ def build_roster():
     state_date_key = now.date().isoformat()
 
     # --- Fetch scheduled shifts for today ---
-    shifts_data = _post(
-        "org_scheduled_shifts",
-        {"type": "json", "start_date": start_date, "end_date": end_date},
-    )
+    shifts_data = _fetch_shifts_cached(start_date, end_date, force_refresh)
 
     if shifts_data is None:
         error_info = LAST_SHIFTADMIN_ERROR or {}
@@ -937,6 +1003,7 @@ def build_roster():
         "supertrack_state": supertrack_state,
         "supertrack_selection_mode": selection_mode,
         "next_up": next_up,
+        "assignment_history": _get_assignment_history(),
     }
 
 
@@ -949,7 +1016,7 @@ def index():
 @app.route("/api/roster")
 @_require_auth
 def api_roster():
-    return jsonify(build_roster())
+    return jsonify(build_roster(force_refresh=request.args.get("refresh") == "1"))
 
 
 def _find_active_physician(roster, shift_key):
@@ -1003,9 +1070,21 @@ def handle_record_assignment(payload):
         return
 
     _increment_assignment_count(shift_key)
+    _record_assignment_history(physician.get("name", "Unknown"), (area or {}).get("name", ""))
     _record_streak_assignment(datetime.now().date().isoformat(), _physician_key(physician))
     if area and (area.get("is_supertrack") or area.get("name") in ROTATION_POD_AREAS):
-        _advance_rotation_counter(datetime.now().date().isoformat())
+        date_key = datetime.now().date().isoformat()
+        steps = 1
+        slots = _build_rotation_slots(roster.get("areas", []))
+        if slots:
+            chosen, offset = _pick_rotation_slot(
+                slots, _get_rotation_counter(date_key), _get_skipped_keys(date_key)
+            )
+            assigned_slot = "supertrack" if area.get("is_supertrack") else area.get("name")
+            # Move past skipped slots so a skipped pod isn't re-recommended right away.
+            if assigned_slot == chosen:
+                steps = offset + 1
+        _advance_rotation_counter(date_key, steps)
     # A real assignment ends the current round, so skipped entities are eligible again.
     _clear_skipped_keys(datetime.now().date().isoformat())
     if area and area.get("is_supertrack"):

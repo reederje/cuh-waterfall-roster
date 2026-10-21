@@ -442,6 +442,32 @@
       white-space: nowrap;
     }
 
+    /* ── Assignment history ──────────────────────────────────────── */
+    #history-panel {
+      width: fit-content;
+      max-width: 100%;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1rem;
+    }
+    #history-panel h3 {
+      font-size: 0.85rem;
+      color: #8b949e;
+      margin-bottom: 0.4rem;
+    }
+    #history-list { list-style: none; }
+    #history-list li {
+      display: grid;
+      grid-template-columns: 14rem 7rem auto;
+      gap: 1rem;
+      padding: 0.2rem 0;
+      font-size: 0.85rem;
+    }
+    .history-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .history-area, .history-time { color: #8b949e; white-space: nowrap; }
+
     /* ── Loading overlay ─────────────────────────────────────────── */
     #loading {
       display: none;
@@ -487,6 +513,10 @@
 
   <main>
     <div id="error-banner"></div>
+    <div id="history-panel">
+      <h3>Recent assignments</h3>
+      <ul id="history-list"></ul>
+    </div>
     <div id="areas-grid"></div>
   </main>
 
@@ -510,6 +540,7 @@
           <ul>
             <li><strong>Click on any physician</strong> to record that they've been assigned the next patient</li>
             <li>The system will update their patient count and adjust the rotation order</li>
+            <li>The <strong>Recent assignments</strong> panel shows the last 3 physicians assigned a patient and the time of each assignment</li>
             <li>Look for visual feedback when the update completes</li>
           </ul>
         </div>
@@ -566,7 +597,8 @@
           <ul>
             <li>Click the <strong>⏭ Skip next up</strong> button to pass on the current recommendation without recording a patient assignment</li>
             <li>The rotation immediately re-selects the next physician or pod, excluding whoever was just skipped</li>
-            <li>Skipped physicians/pods are not penalized — their patient counts stay unchanged, and they become eligible again once any new assignment is recorded</li>
+            <li>Skipped physicians/pods are not penalized — their patient counts stay unchanged</li>
+            <li>A skipped pod (Gray or Purple) loses its turn for the current round — after the next assignment the rotation continues past it, and the pod comes up again in its normal place in the next round</li>
           </ul>
         </div>
 
@@ -660,6 +692,20 @@
     }
 
     // ── Render ─────────────────────────────────────────────────────
+
+    function renderHistory(history) {
+      const list = document.getElementById('history-list');
+      if (!history || !history.length) {
+        list.innerHTML = '<li><span class="history-area">No assignments yet</span></li>';
+        return;
+      }
+      list.innerHTML = history.map(h => `
+        <li>
+          <span class="history-name">${esc(h.name)}</span>
+          <span class="history-area">${esc(h.area)}</span>
+          <span class="history-time">${esc(formatDateTime(h.assigned_at))}</span>
+        </li>`).join('');
+    }
 
     function renderAreas(areas) {
       const grid = document.getElementById('areas-grid');
@@ -800,7 +846,7 @@
 
     // ── Fetch ──────────────────────────────────────────────────────
 
-    async function fetchRoster() {
+    async function fetchRoster(forceRefresh = false) {
       const btn = document.getElementById('refresh-btn');
       const loading = document.getElementById('loading');
       const errorBanner = document.getElementById('error-banner');
@@ -811,7 +857,7 @@
       errorBanner.style.display = 'none';
 
       try {
-        const resp = await fetch('/api/roster');
+        const resp = await fetch(forceRefresh ? '/api/roster?refresh=1' : '/api/roster');
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
 
@@ -820,6 +866,7 @@
           errorBanner.style.display = 'block';
         }
 
+        renderHistory(data.assignment_history);
         supertrackState = data.supertrack_state || {};
         nextUp = data.next_up || null;
         selectionMode = data.supertrack_selection_mode || 'phase_multiplier';
@@ -850,7 +897,7 @@
     // ── Init ───────────────────────────────────────────────────────
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
-      fetchRoster().finally(scheduleRefresh);
+      fetchRoster(true).finally(scheduleRefresh);
     });
 
     document.getElementById('skip-btn').addEventListener('click', () => {
@@ -862,6 +909,7 @@
     socket.on('roster_updated', payload => {
       assignmentPending = false;
       if (!payload || !Array.isArray(payload.areas)) return;
+      renderHistory(payload.assignment_history);
       supertrackState = payload.supertrack_state || {};
       nextUp = payload.next_up || null;
       selectionMode = payload.supertrack_selection_mode || 'phase_multiplier';
